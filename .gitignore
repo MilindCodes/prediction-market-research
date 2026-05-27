@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.venv/
+env/
+venv/
+
+# Mac
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Claude Code local settings
+.claude/
+
+# Word/Office files (not git-friendly binary format)
+*.docx
+*.doc
