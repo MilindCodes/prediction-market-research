@@ -1,8 +1,20 @@
 import os
 from pathlib import Path
 
-KALSHI_API_KEY = os.environ.get("KALSHI_API_KEY", "")
 POLYMARKET_API_KEY = os.environ.get("POLYMARKET_API_KEY", "")
+
+# Kalshi auth — two options (use whichever you have):
+#   Option A (simple Bearer token): set KALSHI_API_KEY
+#   Option B (RSA key file, downloaded from Kalshi dashboard):
+#     1. Go to kalshi.com → Settings → API Keys → Create Key → Download .pem
+#     2. Set KALSHI_KEY_FILE to the path of that .pem file
+#     3. Set KALSHI_KEY_ID to the key ID shown in the dashboard
+KALSHI_API_KEY = os.environ.get("KALSHI_API_KEY", "")
+KALSHI_KEY_ID = os.environ.get("KALSHI_KEY_ID", "")
+KALSHI_KEY_FILE = os.environ.get(
+    "KALSHI_KEY_FILE",
+    str(Path(__file__).parent / "researchproject2.txt"),
+)
 
 DATE_RANGE_START = "2022-01-01"
 DATE_RANGE_END = "2024-12-31"
@@ -20,10 +32,28 @@ FED_KEYWORDS = [
     "basis point", "bps", "powell", "federal open market",
 ]
 
+# CPI / macro economic release keywords
+CPI_KEYWORDS = [
+    "cpi", "consumer price", "core cpi", "inflation",
+    "pce", "personal consumption expenditure",
+    "ppi", "producer price",
+    "gdp", "gross domestic product",
+    "nonfarm payroll", "jobs report", "unemployment rate",
+    "retail sales", "durable goods",
+]
+
+# Combined economic keywords used by the catalog to filter for relevant markets
+ECONOMIC_KEYWORDS = FED_KEYWORDS + CPI_KEYWORDS
+
 POLITICAL_KEYWORDS = [
     "election", "president", "senate", "congress", "vote",
     "governor", "democrat", "republican", "primary", "midterm",
 ]
+
+# Probability bounds applied before log-odds transform.
+# Prices below/above these are truncated to avoid log(0) / log(inf).
+LOG_ODDS_CLIP_LO: float = 0.02
+LOG_ODDS_CLIP_HI: float = 0.98
 
 # Kalshi Elections API only has data from ~2026 onwards.
 # Polymarket has full 2022-2024 history. Two separate date windows:

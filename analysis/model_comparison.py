@@ -24,6 +24,7 @@ class ModelComparison:
     BS_K = 1        # Black-Scholes: one free parameter (constant sigma)
     HESTON_K = 5
     BATES_K = 8
+    VAR_FLOOR = 1e-4  # σ²_floor = 0.01² — prevents QLIKE ratio blow-up near σ̂²→0
 
     def __init__(self, data_dir: Path | None = None):
         self.data_dir = data_dir or config.DATA_DIR
@@ -119,19 +120,22 @@ class ModelComparison:
             "ll_bs": bs.get("log_likelihood", np.nan),
             "aic_bs": self._aic(bs.get("log_likelihood", np.nan), self.BS_K),
             "bic_bs": self._bic(bs.get("log_likelihood", np.nan), self.BS_K, n),
-            "qlike_bs": qlike_bs,
+            "qlike_median_bs": qlike_bs["median"],
+            "qlike_mean_bs": qlike_bs["mean"],
             # Heston (k=5)
             "mse_heston": h.get("mse", np.nan),
             "ll_heston": ll_h,
             "aic_heston": aic_h,
             "bic_heston": bic_h,
-            "qlike_heston": qlike_h,
+            "qlike_median_heston": qlike_h["median"],
+            "qlike_mean_heston": qlike_h["mean"],
             # Bates (k=8)
             "mse_bates": b.get("mse", np.nan),
             "ll_bates": ll_b,
             "aic_bates": aic_b,
             "bic_bates": bic_b,
-            "qlike_bates": qlike_b,
+            "qlike_median_bates": qlike_b["median"],
+            "qlike_mean_bates": qlike_b["mean"],
             # Likelihood ratio test: Bates vs Heston (chi-sq, 3 df)
             "lr_statistic": lr_stat,
             "p_value_jump": p_value,
@@ -142,53 +146,55 @@ class ModelComparison:
             "near_resolution_frac": near_resolution_frac,
         }
 
-    def _qlike_bs(self, ticker: str, bs: dict) -> float:
-        """QLIKE loss for the Black-Scholes constant-variance model."""
+    def _qlike_bs(self, ticker: str, bs: dict) -> dict:
+        """QLIKE loss for the Black-Scholes constant-variance model.
+
+        Returns dict with 'median' (primary) and 'mean' (secondary).
+        """
+        nan_result = {"median": np.nan, "mean": np.nan}
         iv_path = self.iv_dir / f"{ticker}.parquet"
         if not iv_path.exists():
-            return np.nan
+            return nan_result
         sigma_bs = bs.get("sigma_bs", np.nan)
         if not np.isfinite(sigma_bs) or sigma_bs <= 0:
-            return np.nan
+            return nan_result
         iv_df = pd.read_parquet(iv_path)
+        if "near_boundary" in iv_df.columns:
+            iv_df = iv_df[~iv_df["near_boundary"]]
         sigma_obs = iv_df["sigma_implied"].dropna().values
-        var_obs = sigma_obs ** 2
-        var_bs = sigma_bs ** 2
-        valid = var_obs > 0
-        if valid.sum() == 0:
-            return np.nan
-        ratio = var_obs[valid] / var_bs
-        return float(np.mean(ratio - np.log(ratio) - 1))
+        if len(sigma_obs) == 0:
+            return nan_result
+        var_obs = np.maximum(sigma_obs ** 2, self.VAR_FLOOR)
+        var_bs = max(sigma_bs ** 2, self.VAR_FLOOR)
+        ratio = var_obs / var_bs
+        pointwise = ratio - np.log(ratio) - 1.0
+        return {"median": float(np.median(pointwise)), "mean": float(np.mean(pointwise))}
 
-    def _qlike(self, ticker: str, model: str) -> float:
+    def _qlike(self, ticker: str, model: str) -> dict:
         """Compute QLIKE loss for a fitted model.
 
-        QLIKE = mean(sigma^2 / sigma_hat^2 - log(sigma^2 / sigma_hat^2) - 1)
+        QLIKE = σ²/σ̂² - log(σ²/σ̂²) - 1, with a variance floor to prevent
+        blow-up when σ̂²→0. Near-boundary rows (price<0.05 or >0.95) are
+        excluded because Jacobian amplification makes σ_implied unreliable there.
 
-        Parameters
-        ----------
-        ticker : str
-            Contract identifier.
-        model : str
-            "heston" or "bates".
-
-        Returns
-        -------
-        float
-            QLIKE loss, or NaN if data unavailable.
+        Returns dict with 'median' (primary) and 'mean' (secondary).
         """
+        nan_result = {"median": np.nan, "mean": np.nan}
         iv_path = self.iv_dir / f"{ticker}.parquet"
         if not iv_path.exists():
-            return np.nan
+            return nan_result
 
         param_dir = self.heston_dir if model == "heston" else self.bates_dir
         param_path = param_dir / f"{ticker}.json"
         if not param_path.exists():
-            return np.nan
+            return nan_result
 
         iv_df = pd.read_parquet(iv_path)
+        if "near_boundary" in iv_df.columns:
+            iv_df = iv_df[~iv_df["near_boundary"]]
         sigma_obs = iv_df["sigma_implied"].dropna().values
-        var_obs = sigma_obs ** 2
+        if len(sigma_obs) == 0:
+            return nan_result
 
         with open(param_path) as f:
             params = json.load(f)
@@ -198,21 +204,30 @@ class ModelComparison:
             from src.models.heston import HestonCalibrator
             p = np.array([params["kappa"], params["theta"], params["xi"],
                           params["rho"], params["v0"]])
-            var_model = HestonCalibrator._simulate_variance_path(p, len(var_obs), dt)
+            var_model_full = HestonCalibrator._simulate_variance_path(p, len(iv_df), dt)
         else:
             from src.models.bates import BatesCalibrator
             p = np.array([params["kappa"], params["theta"], params["xi"],
                           params["rho"], params["v0"], params["lambda_j"],
                           params["mu_j"], params["sigma_j"]])
-            var_model = BatesCalibrator._simulate_bates_variance_path(p, len(var_obs), dt)
+            var_model_full = BatesCalibrator._simulate_bates_variance_path(p, len(iv_df), dt)
 
-        valid = (var_model > 0) & (var_obs > 0)
-        if valid.sum() == 0:
-            return np.nan
+        # Align model path with non-NaN, non-boundary observed rows.
+        valid_idx = iv_df.index[iv_df["sigma_implied"].notna()].tolist()
+        if len(valid_idx) == 0:
+            return nan_result
 
-        ratio = var_obs[valid] / var_model[valid]
-        qlike = float(np.mean(ratio - np.log(ratio) - 1))
-        return qlike
+        # var_model_full is indexed 0..len(iv_df)-1 over the filtered DataFrame.
+        # Re-index to match filtered df positional indices.
+        filtered_positions = np.arange(len(iv_df))[iv_df["sigma_implied"].notna().values]
+        var_model = var_model_full[filtered_positions]
+
+        var_obs = np.maximum(sigma_obs ** 2, self.VAR_FLOOR)
+        var_model = np.maximum(var_model, self.VAR_FLOOR)
+
+        ratio = var_obs / var_model
+        pointwise = ratio - np.log(ratio) - 1.0
+        return {"median": float(np.median(pointwise)), "mean": float(np.mean(pointwise))}
 
     @staticmethod
     def _aic(log_likelihood: float, k: int) -> float:
@@ -266,7 +281,8 @@ class ModelComparison:
             Full comparison summary.
         """
         metrics = ["mse_bs", "mse_heston", "mse_bates",
-                   "aic_bs", "aic_heston", "aic_bates"]
+                   "aic_bs", "aic_heston", "aic_bates",
+                   "qlike_median_bs", "qlike_median_heston", "qlike_median_bates"]
 
         print("\n--- By Platform ---")
         if "platform" in df.columns:
