@@ -597,6 +597,113 @@ class BatesSMM:
 
 
 # ---------------------------------------------------------------------------
+# Identification check (§4.3)
+# ---------------------------------------------------------------------------
+
+def identification_check(
+    result: "SMMResult",
+    cache: dict,
+    h_frac: float = 0.20,
+) -> "pd.DataFrame":
+    """§4.3 identification check.
+
+    Perturb σ_v and σ_J each by ±h_frac (default ±20%) and report how much
+    each moment changes.  The spec requires that σ_v primarily moves the
+    ACF-of-squares moments (vol clustering) and σ_J primarily moves the
+    tail (95th pct) and kurtosis.  If both parameters move the same moments,
+    the point estimates shouldn't be trusted.
+
+    Returns a DataFrame with columns:
+      moment, sigma_v_sensitivity, sigma_J_sensitivity, identified_by
+    """
+    sv    = result.sigma_v
+    sJ    = result.sigma_J
+    kappa = result.kappa
+    theta = result.theta
+    lam   = result.lambda_
+    rho   = result.rho
+    randoms = cache["randoms"]
+    n_sim   = cache["n_sim"]
+
+    # Reuse a BatesSMM instance to get _simulate_moments (avoids re-importing
+    # _simulate_path which lives in the same module — the circular guard above
+    # is no longer needed, but a method call is cleaner).
+    _cal = BatesSMM()
+
+    def _moments_at(sv_: float, sJ_: float) -> np.ndarray:
+        return _cal._simulate_moments(sv_, sJ_, kappa, theta, lam, rho, n_sim, randoms)
+
+    m_base = _moments_at(sv, sJ)
+
+    rows = []
+    for param_name, sv_p, sJ_p in [
+        ("sigma_v", sv * (1 + h_frac), sJ),
+        ("sigma_v", sv * (1 - h_frac), sJ),
+        ("sigma_J", sv, sJ * (1 + h_frac)),
+        ("sigma_J", sv, sJ * (1 - h_frac)),
+    ]:
+        m_pert = _moments_at(sv_p, sJ_p)
+        for j, label in enumerate(MOMENT_LABELS):
+            base = m_base[j]
+            if abs(base) > 1e-10:
+                sens = (m_pert[j] - base) / abs(base)
+            else:
+                sens = m_pert[j] - base
+            rows.append({"param": param_name, "moment": label,
+                         "sensitivity": float(sens)})
+
+    df = pd.DataFrame(rows)
+    # Average absolute sensitivity per (param, moment)
+    agg = (
+        df.groupby(["param", "moment"])["sensitivity"]
+          .apply(lambda x: float(np.mean(np.abs(x))))
+          .reset_index(name="abs_sensitivity")
+    )
+    wide = agg.pivot(index="moment", columns="param", values="abs_sensitivity")
+    wide.columns.name = None
+    wide = wide.reindex(MOMENT_LABELS)
+
+    sv_col = "sigma_v" if "sigma_v" in wide.columns else None
+    sJ_col = "sigma_J" if "sigma_J" in wide.columns else None
+
+    if sv_col and sJ_col:
+        wide["identified_by"] = wide.apply(
+            lambda r: "sigma_v" if r[sv_col] > r[sJ_col] else "sigma_J",
+            axis=1,
+        )
+    wide = wide.reset_index()
+
+    print("\n=== §4.3 Identification Check ===")
+    print(f"  Perturbation: ±{h_frac*100:.0f}% of optimal parameters")
+    print(f"  σ_v = {sv:.4f},  σ_J = {sJ:.4f}")
+    print()
+    print(wide.to_string(index=False, float_format="{:.4f}".format))
+
+    # Warn if identification is poor
+    if sv_col and sJ_col:
+        acf_moments = [m for m in MOMENT_LABELS if "ACF" in m]
+        tail_moments = [m for m in MOMENT_LABELS if "95th" in m or "Kurt" in m]
+        acf_rows  = wide[wide["moment"].isin(acf_moments)]
+        tail_rows = wide[wide["moment"].isin(tail_moments)]
+
+        sv_drives_acf  = (acf_rows[sv_col]  > acf_rows[sJ_col]).all()
+        sJ_drives_tail = (tail_rows[sJ_col] > tail_rows[sv_col]).all()
+
+        if sv_drives_acf and sJ_drives_tail:
+            print("\n  Identification: PASS")
+            print("    σ_v drives ACF-of-squares; σ_J drives tail + kurtosis")
+        else:
+            print("\n  Identification: WARNING")
+            if not sv_drives_acf:
+                print("    σ_v does NOT dominate ACF moments — vol-of-vol hard to pin down")
+            if not sJ_drives_tail:
+                print("    σ_J does NOT dominate tail + kurtosis — jump size hard to pin down")
+            print("    Point estimates may not be trustworthy individually.")
+
+    return wide
+
+
+# ---------------------------------------------------------------------------
 # J-test (standalone — also used by NestedLadder)
 # ---------------------------------------------------------------------------
 

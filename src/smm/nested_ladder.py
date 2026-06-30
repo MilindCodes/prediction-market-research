@@ -439,3 +439,300 @@ class NestedLadder:
         out = config.DATA_DIR / "processed" / "smm_ladder_results.csv"
         df.to_csv(out, index=False, float_format="%.6f")
         print(f"\nLadder results saved: {out}")
+
+
+# ---------------------------------------------------------------------------
+# §4.6  Which moments do the selecting
+# ---------------------------------------------------------------------------
+
+def moment_selection_analysis(
+    ladder_result: LadderResult,
+    figures_dir: "Path | None" = None,
+) -> pd.DataFrame:
+    """§4.6 — Explicitly show which moments each model hits and misses.
+
+    The load-bearing claim:
+      ACF-of-squares moments (lag 1, lag 2) → what stochastic vol buys
+      Tail (95th pct) + kurtosis            → what jumps buy
+
+    If Heston fails on the tail moment and Bates fixes it, that is the
+    economic argument for jumps.  This function makes that pattern explicit.
+
+    Returns a wide DataFrame: moments as rows, models as columns.
+    Saves a heatmap figure.
+    """
+    figures_dir = figures_dir or (config.DATA_DIR / "processed" / "figures")
+    Path(figures_dir).mkdir(parents=True, exist_ok=True)
+
+    models = [
+        ladder_result.constant_vol,
+        ladder_result.heston,
+        ladder_result.bates,
+        ladder_result.merton,
+    ]
+    target = models[0].moments_real
+
+    data: dict[str, list] = {"Moment": MOMENT_LABELS, "Target": list(target)}
+    for m in models:
+        data[m.model] = list(m.moments_sim)
+
+    df = pd.DataFrame(data)
+
+    # Compute relative miss: (achieved - target) / |target|
+    for m in models:
+        col = f"miss_{m.model}"
+        df[col] = (df[m.model] - df["Target"]) / df["Target"].abs().clip(lower=1e-10)
+
+    print("\n=== §4.6 Which moments do the selecting ===")
+    print("\nTarget vs achieved (absolute values):")
+    print(df[["Moment", "Target"] + [m.model for m in models]].to_string(
+        index=False, float_format="{:.4f}".format
+    ))
+
+    # Narrative
+    print("\nMoment-level diagnosis:")
+    acf_moments  = ["ACF(ΔX², lag=1)", "ACF(ΔX², lag=2)"]
+    tail_moments = ["Kurt(ΔX)", "95th pct(ΔX)"]
+
+    for row in df.itertuples():
+        moment = row.Moment
+        tgt    = row.Target
+        hes    = getattr(row, "Heston", np.nan)
+        bat    = getattr(row, "Bates",  np.nan)
+
+        hes_miss = abs(hes - tgt) / max(abs(tgt), 1e-10)
+        bat_miss = abs(bat - tgt) / max(abs(tgt), 1e-10)
+
+        tag = ""
+        if moment in acf_moments:
+            tag = "← SV (Heston) should fix this"
+        elif moment in tail_moments:
+            tag = "← Jumps (Bates) should fix this"
+
+        status = ""
+        if hes_miss > 0.20 and bat_miss < hes_miss * 0.5:
+            status = f"Heston fails ({hes_miss:.0%} off), Bates fixes ({bat_miss:.0%} off) ✓"
+        elif hes_miss < 0.10:
+            status = f"Heston already fits ({hes_miss:.0%} off)"
+        else:
+            status = f"Heston {hes_miss:.0%} off, Bates {bat_miss:.0%} off"
+
+        print(f"  {moment:<28s}  {status}  {tag}")
+
+    # Heatmap of relative misses
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib.colors as mcolors
+
+        miss_cols = [f"miss_{m.model}" for m in models]
+        miss_data = df[miss_cols].values
+        model_labels = [m.model for m in models]
+
+        fig, ax = plt.subplots(figsize=(9, 4))
+        cmap = plt.cm.RdYlGn_r
+        im = ax.imshow(miss_data.T, aspect="auto", cmap=cmap, vmin=-1, vmax=1)
+        ax.set_xticks(range(N_MOMENTS))
+        ax.set_xticklabels(MOMENT_LABELS, rotation=25, ha="right", fontsize=8)
+        ax.set_yticks(range(len(model_labels)))
+        ax.set_yticklabels(model_labels)
+        plt.colorbar(im, ax=ax, label="Relative miss (achieved−target)/|target|")
+        ax.set_title("§4.6 Moment fit by model  (green=good, red=misses)")
+
+        # Annotate with numbers
+        for i in range(N_MOMENTS):
+            for j, m in enumerate(models):
+                val = miss_data[i, j]
+                ax.text(i, j, f"{val:+.2f}", ha="center", va="center",
+                        fontsize=7, color="white" if abs(val) > 0.5 else "black")
+
+        plt.tight_layout()
+        out = Path(figures_dir) / "moment_selection.png"
+        plt.savefig(out, dpi=130, bbox_inches="tight")
+        plt.close()
+        print(f"\n  Figure: {out}")
+    except Exception as e:
+        print(f"  (Figure skipped: {e})")
+
+    return df
+
+
+# ---------------------------------------------------------------------------
+# §4.8  Robustness: truncation sensitivity and frequency sensitivity
+# ---------------------------------------------------------------------------
+
+def truncation_sensitivity(
+    panel_base: "pd.DataFrame",
+    calibrator: "BatesSMM",
+    kappa: float = 5.0,
+    clip_pairs: "list[tuple[float, float]] | None" = None,
+    figures_dir: "Path | None" = None,
+) -> pd.DataFrame:
+    """§4.8 — Re-run Bates SMM at alternative clip bounds.
+
+    Baseline is [0.02, 0.98].  The spec specifically requests a [0.01, 0.99]
+    sensitivity to check whether jump evidence is a truncation artifact.
+
+    Re-runs the full panel transformation (clip → logit → diff) for each
+    clip pair, then re-runs the SMM calibration on each resulting panel.
+    Returns a summary DataFrame comparing σ_v, σ_J, J, p across clip pairs.
+    """
+    import config as _cfg
+    from src.smm.panel import CLIP_LO as _DEFAULT_LO, CLIP_HI as _DEFAULT_HI
+
+    clip_pairs = clip_pairs or [
+        (_DEFAULT_LO, _DEFAULT_HI),  # baseline [0.02, 0.98]
+        (0.01, 0.99),                 # wider — spec's referee sensitivity
+    ]
+    figures_dir = figures_dir or (config.DATA_DIR / "processed" / "figures")
+
+    rows = []
+    for clip_lo, clip_hi in clip_pairs:
+        label = f"[{clip_lo},{clip_hi}]"
+        print(f"\n--- Truncation sensitivity {label} ---")
+
+        # Re-apply clip/logit/diff to the base panel's raw p column
+        panel = panel_base.copy()
+        p_re = np.clip(panel["p"].values, clip_lo, clip_hi)
+        X_re = np.log(p_re / (1.0 - p_re))
+
+        # Recompute delta_X within each contract
+        panel["p"] = p_re
+        panel["X"] = X_re
+        new_dx = []
+        for cid, grp in panel.groupby("contract_id", sort=False):
+            grp = grp.sort_values("t")
+            X = grp["X"].values
+            dx = np.empty(len(X))
+            dx[0] = np.nan
+            dx[1:] = X[1:] - X[:-1]
+            new_dx.append(pd.Series(dx, index=grp.index))
+        panel["delta_X"] = pd.concat(new_dx)
+        panel = panel.dropna(subset=["delta_X"]).reset_index(drop=True)
+
+        cache = calibrator.prepare(panel)
+        res   = calibrator.fit_bates(cache, kappa=kappa, verbose=True)
+
+        rows.append({
+            "clip": label, "clip_lo": clip_lo, "clip_hi": clip_hi,
+            "sigma_v": res.sigma_v, "sigma_J": res.sigma_J,
+            "theta": res.theta, "lambda": res.lambda_,
+            "j_stat": res.j_stat, "j_pvalue": res.j_pvalue,
+            "n_real": res.n_real,
+        })
+
+    df = pd.DataFrame(rows)
+    print("\n=== §4.8 Truncation sensitivity ===")
+    print(df.to_string(index=False, float_format="{:.4f}".format))
+
+    out = config.DATA_DIR / "processed" / "smm_truncation_sensitivity.csv"
+    df.to_csv(out, index=False, float_format="%.6f")
+    print(f"Saved: {out}")
+    return df
+
+
+def frequency_sensitivity(
+    raw_dir: "Path | None" = None,
+    calibrator: "BatesSMM | None" = None,
+    kappa: float = 5.0,
+    freqs: "list[str] | None" = None,
+) -> pd.DataFrame:
+    """§4.8 — Re-run panel and SMM at alternative grid frequencies.
+
+    Compares hourly (1h) baseline against coarser grids (2h, 4h).
+    Coarser grids have fewer forward-filled zero-increments but also
+    less data — the sensitivity checks that results are stable.
+    """
+    from src.smm.panel import SMMPanelBuilder
+
+    raw_dir    = raw_dir or (config.DATA_DIR / "raw" / "kalshi")
+    calibrator = calibrator or BatesSMM()
+    freqs      = freqs or ["1h", "2h", "4h"]
+
+    rows = []
+    for freq in freqs:
+        print(f"\n--- Frequency sensitivity: {freq} ---")
+        builder = SMMPanelBuilder(freq=freq)
+        tickers = builder._load_catalog_tickers()
+        if not tickers:
+            print("  No tickers — run catalog step first.")
+            continue
+        panel = builder.build(tickers=tickers, force=True)
+        cache = calibrator.prepare(panel)
+        res   = calibrator.fit_bates(cache, kappa=kappa, verbose=True)
+        rows.append({
+            "freq": freq, "n_contracts": panel["contract_id"].nunique(),
+            "n_real": res.n_real,
+            "sigma_v": res.sigma_v, "sigma_J": res.sigma_J,
+            "j_stat": res.j_stat, "j_pvalue": res.j_pvalue,
+        })
+
+    df = pd.DataFrame(rows)
+    print("\n=== §4.8 Frequency sensitivity ===")
+    if not df.empty:
+        print(df.to_string(index=False, float_format="{:.4f}".format))
+        out = config.DATA_DIR / "processed" / "smm_frequency_sensitivity.csv"
+        df.to_csv(out, index=False, float_format="%.6f")
+        print(f"Saved: {out}")
+    return df
+
+
+def bucketing_analysis(
+    panel: "pd.DataFrame",
+    calibrator: "BatesSMM | None" = None,
+    kappa: float = 5.0,
+    n_buckets: int = 3,
+) -> pd.DataFrame:
+    """§4.8 — Cross-sectional bucketing: run ladder on terciles of contracts.
+
+    Contracts are bucketed by number of increments (a proxy for trading
+    activity / duration).  If σ_v and σ_J are stable across buckets, the
+    estimates aren't driven by a handful of very active contracts.
+    """
+    calibrator = calibrator or BatesSMM()
+
+    # Bucket by contract length
+    lengths = (
+        panel.groupby("contract_id")["delta_X"]
+             .count()
+             .rename("n_increments")
+             .reset_index()
+    )
+    try:
+        lengths["bucket"] = pd.qcut(
+            lengths["n_increments"], q=n_buckets,
+            labels=[f"Q{i+1}" for i in range(n_buckets)],
+            duplicates="drop",
+        )
+    except ValueError:
+        lengths["bucket"] = "Q1"
+
+    rows = []
+    for bucket_label, bucket_tickers in lengths.groupby("bucket", observed=True)["contract_id"]:
+        sub = panel[panel["contract_id"].isin(bucket_tickers)]
+        n_c = sub["contract_id"].nunique()
+        if n_c < 3:
+            print(f"  Bucket {bucket_label}: only {n_c} contracts, skipping")
+            continue
+
+        print(f"\n--- Bucket {bucket_label} ({n_c} contracts) ---")
+        cache = calibrator.prepare(sub)
+        res   = calibrator.fit_bates(cache, kappa=kappa, verbose=True)
+
+        avg_len = float(lengths.loc[
+            lengths["contract_id"].isin(bucket_tickers), "n_increments"
+        ].mean())
+        rows.append({
+            "bucket": str(bucket_label), "n_contracts": n_c,
+            "avg_increments": avg_len,
+            "sigma_v": res.sigma_v, "sigma_J": res.sigma_J,
+            "j_stat": res.j_stat, "j_pvalue": res.j_pvalue,
+        })
+
+    df = pd.DataFrame(rows)
+    print("\n=== §4.8 Cross-sectional bucketing ===")
+    if not df.empty:
+        print(df.to_string(index=False, float_format="{:.4f}".format))
+        out = config.DATA_DIR / "processed" / "smm_bucketing.csv"
+        df.to_csv(out, index=False, float_format="%.6f")
+        print(f"Saved: {out}")
+    return df

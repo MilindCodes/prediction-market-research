@@ -193,18 +193,84 @@ def step_split() -> None:
               f"J(B)={lr.bates.j_stat:.3f}")
 
 
+def step_identify(kappa: float = 5.0) -> None:
+    """§4.3  Identification check — which params move which moments."""
+    print("\n=== Step: identify ===")
+    import pandas as pd
+    from src.smm.bates_smm import BatesSMM, identification_check
+
+    panel = pd.read_parquet("data/processed/smm_panel.parquet")
+    cal   = BatesSMM(n_sim_multiplier=20, n_bootstrap=300, n_restarts=3)
+    cache = cal.prepare(panel)
+    result = cal.fit_bates(cache, kappa=kappa, verbose=True)
+    identification_check(result, cache, h_frac=0.20)
+
+
+def step_select(kappa: float = 5.0) -> None:
+    """§4.6  Which moments do the selecting."""
+    print("\n=== Step: select ===")
+    import pandas as pd
+    from src.smm.bates_smm import BatesSMM
+    from src.smm.nested_ladder import NestedLadder, moment_selection_analysis
+
+    panel  = pd.read_parquet("data/processed/smm_panel.parquet")
+    cal    = BatesSMM(n_sim_multiplier=20, n_bootstrap=300, n_restarts=3)
+    ladder = NestedLadder(calibrator=cal, kappa_grid=[kappa])
+    results = ladder.run(panel, verbose=True)
+    moment_selection_analysis(results[0])
+
+
+def step_trunc_sensitivity(kappa: float = 5.0) -> None:
+    """§4.8  Truncation sensitivity: [0.02, 0.98] vs [0.01, 0.99]."""
+    print("\n=== Step: trunc-sensitivity ===")
+    import pandas as pd
+    from src.smm.bates_smm import BatesSMM
+    from src.smm.nested_ladder import truncation_sensitivity
+
+    panel = pd.read_parquet("data/processed/smm_panel.parquet")
+    cal   = BatesSMM(n_sim_multiplier=20, n_bootstrap=300, n_restarts=3)
+    truncation_sensitivity(panel, cal, kappa=kappa)
+
+
+def step_freq_sensitivity(kappa: float = 5.0) -> None:
+    """§4.8  Frequency sensitivity: 1h vs 2h vs 4h grid."""
+    print("\n=== Step: freq-sensitivity ===")
+    from src.smm.bates_smm import BatesSMM
+    from src.smm.nested_ladder import frequency_sensitivity
+
+    cal = BatesSMM(n_sim_multiplier=20, n_bootstrap=300, n_restarts=3)
+    frequency_sensitivity(calibrator=cal, kappa=kappa, freqs=["1h", "2h", "4h"])
+
+
+def step_bucketing(kappa: float = 5.0) -> None:
+    """§4.8  Cross-sectional bucketing by contract length."""
+    print("\n=== Step: bucketing ===")
+    import pandas as pd
+    from src.smm.bates_smm import BatesSMM
+    from src.smm.nested_ladder import bucketing_analysis
+
+    panel = pd.read_parquet("data/processed/smm_panel.parquet")
+    cal   = BatesSMM(n_sim_multiplier=20, n_bootstrap=300, n_restarts=3)
+    bucketing_analysis(panel, cal, kappa=kappa, n_buckets=3)
+
+
 # ---------------------------------------------------------------------------
 # Help
 # ---------------------------------------------------------------------------
 
 STEPS = {
-    "panel":          ("§4.1 Build SMM panel",                         step_panel),
-    "validate-syn":   ("§4.2 Synthetic validation",                    step_validate_synthetic),
-    "stylized":       ("§4.2 Stylized facts on real data",             step_stylized),
-    "calibrate":      ("§4.3 Bates SMM quick check (κ=5)",            lambda: step_calibrate(kappa=5.0)),
-    "ladder":         ("§4.4 Full nested ladder",                      step_ladder),
-    "validate-model": ("§4.7 Validation loop (simulate selected model)",step_validate_model),
-    "split":          ("§4.8 FOMC-vs-CPI robustness split",            step_split),
+    "panel":              ("§4.1  Build SMM panel",                             step_panel),
+    "validate-syn":       ("§4.2  Synthetic validation",                        step_validate_synthetic),
+    "stylized":           ("§4.2  Stylized facts on real data",                 step_stylized),
+    "calibrate":          ("§4.3  Bates SMM quick check (κ=5)",                lambda: step_calibrate(kappa=5.0)),
+    "identify":           ("§4.3  Identification check (σ_v vs σ_J moments)",   step_identify),
+    "ladder":             ("§4.4  Full nested ladder",                          step_ladder),
+    "validate-model":     ("§4.7  Validation loop (simulate selected model)",   step_validate_model),
+    "select":             ("§4.6  Which moments do the selecting",              step_select),
+    "split":              ("§4.8  FOMC-vs-CPI robustness split",               step_split),
+    "trunc-sensitivity":  ("§4.8  Truncation sensitivity [0.02,0.98] vs [0.01,0.99]", step_trunc_sensitivity),
+    "freq-sensitivity":   ("§4.8  Frequency sensitivity 1h/2h/4h",             step_freq_sensitivity),
+    "bucketing":          ("§4.8  Cross-sectional bucketing by contract length", step_bucketing),
 }
 
 
