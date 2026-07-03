@@ -9,33 +9,19 @@ import config
 
 
 # ---------------------------------------------------------------------------
-# Known Kalshi political series tickers (2022-2024).
-# These are pulled individually — each one is fast (1-2 API calls max).
-# The broad category=Elections filter is NOT used because the API ignores it
-# and paginates through all events indefinitely.
+# Known Kalshi economic indicator series tickers.
+# Pulled individually — each is fast (1-2 API calls max).
+# Focus: FOMC rate decisions, CPI releases, and other macro data events.
+# Political/election markets are excluded (too overdone as a category).
 # ---------------------------------------------------------------------------
-POLITICAL_SERIES_TICKERS = [
-    # 2022 Senate midterms
-    "KXGARSENMATCHUP",   # Georgia Senate runoff (Warnock vs Walker)
-    "SENATEAL",           # Alabama Senate
-    "KXTXSENOUTCOME",     # Texas Senate
-    "KXLASENMATCHUP",     # Louisiana Senate matchup
-    "KXLASEN1R",          # Louisiana Senate first round
-    "KXMOVILSENATED",     # Illinois Senate (Dems)
-    "KXSNPMAJORITY",      # Senate majority (2022 midterms)
-    # 2024 Senate / election-adjacent
-    "KXTXSENATETURNOUTGOPMINUSDEM",
-    "KXTXSENRPRIMARYMOV",
-    "KXTXSENDPRIMARYMOV",
-    "KXTXRSEN2ND",
-    "KXTXRSEN3RD",
-    "KXGAPRIMARY1R",      # Georgia Primary 2024
-    "KXPRIMARYMATCHUP",
-    "KXPRIMARYMOV",
-    # State-level general elections (governors, swing states)
-    "GOVPARTYMS",         # Mississippi Governor
-    "GOVPARTYLA",         # Louisiana Governor
-    "GOVPARTYKY",         # Kentucky Governor
+ECONOMIC_SERIES_TICKERS = [
+    "KXFED",       # FOMC rate decisions (primary series)
+    "KXCPI",       # CPI inflation releases
+    "KXCORECPI",   # Core CPI (ex food & energy)
+    "KXPCE",       # PCE inflation (Fed's preferred gauge)
+    "KXGDP",       # GDP growth releases
+    "KXJOBS",      # Nonfarm payrolls / jobs report
+    "KXUNRATE",    # Unemployment rate
 ]
 
 
@@ -43,24 +29,17 @@ class KalshiCatalog:
     """Pull and filter the Kalshi market catalog using targeted queries.
 
     Strategy:
-      - FED/FOMC: series_ticker=KXFED (exact match, fast, ~500 markets total)
-      - Political: curated list of known series tickers + capped fallback
-        (max 5 pages of unsorted settled events, keyword-filtered)
-
-    This avoids the category=Elections filter which the API ignores,
-    causing infinite pagination.
+      - Pull each known economic series ticker (KXFED, KXCPI, etc.)
+      - Keyword-filter for FOMC / CPI / macro events only
+      - Political and election markets are excluded
 
     Parameters
     ----------
     client : KalshiClient
-        API client (no key needed for reads).
+        API client.
     data_dir : Path
         Root data directory (default from config).
     """
-
-    # Max pages for the fallback political search.
-    # 5 pages x 200 events = 1000 events scanned in ~30 seconds max.
-    POLITICAL_FALLBACK_MAX_PAGES = 5
 
     def __init__(self, client: KalshiClient,
                  data_dir: Path | None = None):
@@ -70,13 +49,11 @@ class KalshiCatalog:
         self.raw_dir.mkdir(parents=True, exist_ok=True)
 
     def pull_catalog(self) -> pd.DataFrame:
-        """Fetch FED and Political markets from the Kalshi Elections API
-        and apply all filters.
+        """Fetch FOMC and economic indicator markets from the Kalshi API.
 
-        NOTE: The Kalshi Elections API only has data from ~2025 onwards
-        (the platform was migrated from the old Kalshi trading API and the
-        historical 2022-2024 data was not preserved). This catalog targets
-        the 2025-2026 date window defined in config.KALSHI_DATE_START/END.
+        Pulls each known economic series ticker (FOMC, CPI, PCE, etc.) and
+        keyword-filters the results. Political and election markets are
+        excluded — we focus on macro economic releases only.
 
         Returns
         -------
@@ -84,84 +61,33 @@ class KalshiCatalog:
             Filtered catalog ready for the liquidity filter step.
         """
         all_markets: list[dict] = []
+        n_series = len(ECONOMIC_SERIES_TICKERS)
 
-        # ---------------------------------------------------------------
-        # Pull 1: FOMC markets — series_ticker=KXFED
-        # The Elections API has KXFED data from 2026 FOMC meetings.
-        # status filter is IGNORED by the API; we filter client-side.
-        # ---------------------------------------------------------------
-        print("  [1/3] Fetching FOMC events (series_ticker=KXFED)...")
-        fed_events = self.client.get(
-            "/events",
-            params={
-                "series_ticker": "KXFED",
-                "with_nested_markets": "true",
-                "limit": 200,
-            },
-            progress_label="FOMC",
-        )
-        fed_markets = self._extract_markets(fed_events, is_fed=True)
-        print(f"       -> {len(fed_events)} events, {len(fed_markets)} markets")
-        all_markets.extend(fed_markets)
-
-        # ---------------------------------------------------------------
-        # Pull 2: Political — capped scan of ALL finalized events,
-        # keyword-filtered. The API returns newest-first so we cap at
-        # POLITICAL_FALLBACK_MAX_PAGES to keep only recent (2025-2026) ones.
-        # ---------------------------------------------------------------
-        print(f"\n  [2/3] Scanning for political events "
-              f"(max {self.POLITICAL_FALLBACK_MAX_PAGES} pages)...")
-        political_events_raw = self.client.get(
-            "/events",
-            params={
-                "with_nested_markets": "true",
-                "limit": 200,
-            },
-            max_pages=self.POLITICAL_FALLBACK_MAX_PAGES,
-            progress_label="political scan",
-        )
-        pol_markets: list[dict] = []
-        for event in political_events_raw:
-            text = (
-                str(event.get("title", "")).lower()
-                + " " + str(event.get("series_ticker", "")).lower()
-                + " " + str(event.get("category", "")).lower()
-            )
-            if any(kw in text for kw in config.POLITICAL_KEYWORDS):
-                pol_markets.extend(
-                    self._extract_markets([event], is_fed=False)
-                )
-        print(f"       -> {len(pol_markets)} keyword-matched political markets")
-        all_markets.extend(pol_markets)
-
-        # ---------------------------------------------------------------
-        # Pull 3: Known current political series (2026 election cycles)
-        # ---------------------------------------------------------------
-        print(f"\n  [3/3] Fetching {len(POLITICAL_SERIES_TICKERS)} known "
-              f"political series tickers...")
-        pol_markets_from_series: list[dict] = []
-        for ticker in POLITICAL_SERIES_TICKERS:
+        print(f"  Fetching {n_series} economic series tickers "
+              f"(FOMC, CPI, PCE, GDP, Jobs, ...)...")
+        for i, series_ticker in enumerate(ECONOMIC_SERIES_TICKERS, 1):
             events = self.client.get(
                 "/events",
                 params={
-                    "series_ticker": ticker,
+                    "series_ticker": series_ticker,
                     "with_nested_markets": "true",
                     "limit": 200,
                 },
+                progress_label=series_ticker,
             )
-            markets = self._extract_markets(events, is_fed=False)
+            is_fed = series_ticker == "KXFED"
+            markets = self._extract_markets(events, is_fed=is_fed)
             if markets:
-                print(f"       {ticker}: {len(markets)} markets")
-            pol_markets_from_series.extend(markets)
-        print(f"       -> {len(pol_markets_from_series)} political markets "
-              f"from known tickers")
-        all_markets.extend(pol_markets_from_series)
+                print(f"  [{i}/{n_series}] {series_ticker}: "
+                      f"{len(events)} events, {len(markets)} markets")
+            all_markets.extend(markets)
 
         # ---------------------------------------------------------------
         # Deduplicate and save
         # ---------------------------------------------------------------
         if not all_markets:
-            print("\nWARNING: No markets fetched. Check your internet connection.")
+            print("\nWARNING: No markets fetched. Check API credentials and "
+                  "internet connection.")
             return pd.DataFrame()
 
         df = pd.DataFrame(all_markets).drop_duplicates(subset=["ticker"])
@@ -202,6 +128,7 @@ class KalshiCatalog:
             self._export_review_csv(df)
             return df
 
+        df["volume_fp"] = pd.to_numeric(df["volume_fp"], errors="coerce").fillna(0)
         count_before = len(df)
         df = df[df["volume_fp"] >= threshold].reset_index(drop=True)
         print(f"  Liquidity filter (volume_fp >= {threshold}): "
@@ -262,7 +189,7 @@ class KalshiCatalog:
         return df
 
     def _classify_keywords(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Tag each contract as is_fed and/or is_political."""
+        """Tag each contract as is_fed and/or is_economic."""
         df = df.copy()
         text = (
             df.get("title", pd.Series("", index=df.index))
@@ -280,15 +207,15 @@ class KalshiCatalog:
             df.get("_is_fed_source", pd.Series(False, index=df.index))
             | text.apply(lambda t: any(kw in t for kw in config.FED_KEYWORDS))
         )
-        df["is_political"] = text.apply(
-            lambda t: any(kw in t for kw in config.POLITICAL_KEYWORDS)
+        df["is_economic"] = text.apply(
+            lambda t: any(kw in t for kw in config.ECONOMIC_KEYWORDS)
         )
         return df
 
     def _apply_filters(self, df: pd.DataFrame) -> pd.DataFrame:
         """Sequential attrition filters with counts printed at each step."""
         print("\n--- Attrition Table (Kalshi) ---")
-        print(f"  0. Raw fetch (FED + Political):    {len(df)}")
+        print(f"  0. Raw fetch (economic series):    {len(df)}")
 
         # Kalshi Elections API uses "finalized" for resolved markets.
         # "settled" is not a valid status on this API.
@@ -315,9 +242,9 @@ class KalshiCatalog:
         df = df[mask].reset_index(drop=True)
         print(f"  3. Duration >= {config.MIN_DURATION_DAYS} days:             {len(df)}")
 
-        mask = df["is_fed"] | df["is_political"]
+        mask = df["is_economic"]
         df = df[mask].reset_index(drop=True)
-        print(f"  4. Fed or Political keyword:       {len(df)}")
+        print(f"  4. Economic keyword match:         {len(df)}")
         print("--------------------------------\n")
 
         return df
@@ -327,7 +254,7 @@ class KalshiCatalog:
         cols = [
             "ticker", "title", "event_title", "series_ticker",
             "open_time", "close_time", "duration_days",
-            "volume_fp", "is_fed", "is_political",
+            "volume_fp", "is_fed", "is_economic",
         ]
         export = df[[c for c in cols if c in df.columns]]
         path = self.raw_dir / "contracts_for_review.csv"

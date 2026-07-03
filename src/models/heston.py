@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -8,6 +9,8 @@ import numpy as np
 from scipy.optimize import minimize
 
 import config
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -76,11 +79,11 @@ class HestonCalibrator:
     """
 
     PARAM_BOUNDS = [
-        (0.01, 20.0),    # kappa
-        (1e-6, 2.0),     # theta
+        (0.01, 50.0),    # kappa  — PM beliefs can mean-revert faster than equity vol
+        (1e-6, 10.0),    # theta  — θ=σ²_LR; with σ_LR up to 8.6, need headroom
         (0.01, 5.0),     # xi
-        (-0.999, 0.999), # rho
-        (1e-6, 2.0),     # v0
+        (-0.999, 0.999), # rho    — free: equity leverage-effect prior doesn't hold
+        (1e-6, 5.0),     # v0     — initial variance was hitting 2.0 ceiling
     ]
     PARAM_NAMES = ["kappa", "theta", "xi", "rho", "v0"]
 
@@ -131,8 +134,14 @@ class HestonCalibrator:
         kappa, theta, xi, rho, v0 = result.x
         feller = 2 * kappa * theta >= xi ** 2
         if not feller:
-            print(f"  [Heston] WARNING: Feller condition violated for {ticker} "
-                  f"(2*kappa*theta={2*kappa*theta:.4f}, xi^2={xi**2:.4f})")
+            _log.warning("Heston: %s — Feller violated (2κθ=%.4f, ξ²=%.4f)",
+                         ticker, 2 * kappa * theta, xi ** 2)
+
+        for name, val, (lo, hi) in zip(self.PARAM_NAMES, result.x, self.PARAM_BOUNDS):
+            tol = 0.01 * (hi - lo)
+            if val <= lo + tol or val >= hi - tol:
+                _log.warning("Heston: %s — param %s at bound (%.6f, bounds=[%s, %s])",
+                             ticker, name, val, lo, hi)
 
         var_model = self._simulate_variance_path(result.x, len(var_observed), dt)
         mse = float(np.mean((var_observed - var_model) ** 2))
@@ -174,8 +183,11 @@ class HestonCalibrator:
         float
             Sum of squared errors.
         """
+        kappa, theta, xi = params[0], params[1], params[2]
+        feller_slack = 2 * kappa * theta - xi ** 2
+        penalty = 1e4 * feller_slack ** 2 if feller_slack < 0 else 0.0
         var_model = self._simulate_variance_path(params, len(var_observed), dt)
-        return float(np.sum((var_observed - var_model) ** 2))
+        return float(np.sum((var_observed - var_model) ** 2)) + penalty
 
     @staticmethod
     def _simulate_variance_path(params: np.ndarray, n: int,

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -10,6 +11,8 @@ from scipy.stats import chi2
 
 from src.models.heston import HestonCalibrator, HestonResult, _json_default
 import config
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -89,20 +92,31 @@ class BatesCalibrator(HestonCalibrator):
     """
 
     BATES_BOUNDS = [
-        (0.01, 20.0),    # kappa
-        (1e-6, 2.0),     # theta
+        (0.01, 50.0),    # kappa
+        (1e-6, 10.0),    # theta
         (0.01, 5.0),     # xi
         (-0.999, 0.999), # rho
-        (1e-6, 2.0),     # v0
-        (0.0, 50.0),     # lambda_j
-        (-2.0, 2.0),     # mu_j
-        (0.001, 2.0),    # sigma_j
+        (1e-6, 5.0),     # v0
+        (0.0, 100.0),    # lambda_j — ceiling of 50 was binding in 24% of fits
+        (-5.0, 5.0),     # mu_j     — widen to let optimizer escape μ_J=0 local min
+        (0.001, 3.0),    # sigma_j
     ]
     BATES_PARAM_NAMES = [
         "kappa", "theta", "xi", "rho", "v0",
         "lambda_j", "mu_j", "sigma_j",
     ]
     JUMP_DOF = 3
+
+    # Five initializations covering baseline, positive/negative mean jump,
+    # high-vol high-jump, and near-resolution regime.
+    # (kappa, theta, xi, rho, v0, lambda_j, mu_j, sigma_j)
+    BATES_INIT_GRID = [
+        ( 1.0, 0.5, 0.5, -0.3, 0.1,  2.0,  0.0, 0.3),
+        ( 1.0, 0.5, 0.5, -0.3, 0.1,  2.0, +0.5, 0.3),
+        ( 1.0, 0.5, 0.5, -0.3, 0.1,  2.0, -0.5, 0.3),
+        ( 5.0, 1.0, 1.0,  0.0, 0.5, 10.0, +1.0, 0.5),
+        ( 0.5, 2.0, 0.3, +0.5, 0.2,  5.0, -1.0, 0.8),
+    ]
 
     def __init__(self, data_dir: Path | None = None):
         super().__init__(data_dir)
@@ -142,21 +156,38 @@ class BatesCalibrator(HestonCalibrator):
         if heston_result is None:
             heston_result = super().calibrate(sigma_series, ticker, platform, dt)
 
-        x0 = self._bates_initial_guess(var_observed, heston_result)
+        # Seed the grid with the Heston result as an additional starting point.
+        heston_x0 = self._bates_initial_guess(var_observed, heston_result)
+        init_points = [heston_x0] + [np.array(x0) for x0 in self.BATES_INIT_GRID]
 
-        result = minimize(
-            self._bates_objective,
-            x0,
-            args=(var_observed, dt),
-            method="L-BFGS-B",
-            bounds=self.BATES_BOUNDS,
-            options={"maxiter": 3000, "ftol": 1e-12},
-        )
+        best_result = None
+        best_obj = np.inf
+        for x0 in init_points:
+            res = minimize(
+                self._bates_objective,
+                x0,
+                args=(var_observed, dt),
+                method="L-BFGS-B",
+                bounds=self.BATES_BOUNDS,
+                options={"maxiter": 3000, "ftol": 1e-12},
+            )
+            if res.fun < best_obj:
+                best_obj = res.fun
+                best_result = res
+
+        result = best_result
 
         kappa, theta, xi, rho, v0, lambda_j, mu_j, sigma_j = result.x
         feller = 2 * kappa * theta >= xi ** 2
         if not feller:
-            print(f"  [Bates] WARNING: Feller condition violated for {ticker}")
+            _log.warning("Bates: %s — Feller violated (2κθ=%.4f, ξ²=%.4f)",
+                         ticker, 2 * kappa * theta, xi ** 2)
+
+        for name, val, (lo, hi) in zip(self.BATES_PARAM_NAMES, result.x, self.BATES_BOUNDS):
+            tol = 0.01 * (hi - lo)
+            if val <= lo + tol or val >= hi - tol:
+                _log.warning("Bates: %s — param %s at bound (%.6f, bounds=[%s, %s])",
+                             ticker, name, val, lo, hi)
 
         var_model = self._simulate_bates_variance_path(result.x, len(var_observed), dt)
         mse = float(np.mean((var_observed - var_model) ** 2))
@@ -210,8 +241,11 @@ class BatesCalibrator(HestonCalibrator):
         float
             Sum of squared errors.
         """
+        kappa, theta, xi = params[0], params[1], params[2]
+        feller_slack = 2 * kappa * theta - xi ** 2
+        penalty = 1e4 * feller_slack ** 2 if feller_slack < 0 else 0.0
         var_model = self._simulate_bates_variance_path(params, len(var_observed), dt)
-        return float(np.sum((var_observed - var_model) ** 2))
+        return float(np.sum((var_observed - var_model) ** 2)) + penalty
 
     @staticmethod
     def _simulate_bates_variance_path(params: np.ndarray, n: int,

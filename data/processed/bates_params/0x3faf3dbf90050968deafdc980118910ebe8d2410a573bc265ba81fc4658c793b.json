@@ -1,0 +1,20 @@
+{
+  "ticker": "0x3faf3dbf90050968deafdc980118910ebe8d2410a573bc265ba81fc4658c793b",
+  "platform": "polymarket",
+  "kappa": 0.01,
+  "theta": 5.501226230181294,
+  "xi": 0.3314698800575529,
+  "rho": -0.3,
+  "v0": 5.0,
+  "lambda_j": 60.112360069993414,
+  "mu_j": 1.622746070245879,
+  "sigma_j": 1.354884336353498,
+  "feller_satisfied": true,
+  "converged": true,
+  "mse": 773.6775009544325,
+  "log_likelihood": -920.4412533042633,
+  "log_likelihood_heston": -1239.9328042576258,
+  "lr_statistic": 638.9831019067249,
+  "p_value_jump_significance": 3.564061841678631e-138,
+  "n_obs": 194
+}

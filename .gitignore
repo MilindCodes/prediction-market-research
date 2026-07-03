@@ -24,3 +24,8 @@ venv/
 # Word/Office files (not git-friendly binary format)
 *.docx
 *.doc
+
+# Secrets — API private keys must never be committed
+researchproject2.txt
+*.pem
+*.key

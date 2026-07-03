@@ -11,8 +11,15 @@ import config
 
 
 class KalshiTradesPuller:
-    """Pull tick-level trade data from Kalshi and aggregate into hourly OHLCV
-    bars.
+    """Pull tick-level trade data from Kalshi, aggregate into hourly OHLCV
+    bars, and apply the log-odds preprocessing required for stochastic vol
+    estimation.
+
+    Preprocessing steps (per Riley's spec):
+      1. Truncate close prices to [LOG_ODDS_CLIP_LO, LOG_ODDS_CLIP_HI]
+         (default [0.02, 0.98]) to avoid log(0) / log(inf).
+      2. Compute log-odds: X = log(p / (1 - p))
+      3. Compute increments: deltaX = X[t] - X[t-1]
 
     Parameters
     ----------
@@ -22,19 +29,17 @@ class KalshiTradesPuller:
         Root data directory (default from config).
     """
 
-    def __init__(self, client: KalshiClient,
-                 data_dir: Path | None = None):
+    def __init__(self, client: KalshiClient, data_dir: Path | None = None):
         self.client = client
         self.data_dir = data_dir or config.DATA_DIR
         self.raw_dir = self.data_dir / "raw" / "kalshi"
         self.raw_dir.mkdir(parents=True, exist_ok=True)
 
     def pull(self, tickers: list[str]) -> None:
-        """Download trade data for each ticker and save as hourly OHLCV
+        """Download trade data for each ticker and save as hourly OHLCV + log-odds
         Parquet files.
 
-        Skips tickers whose output file already exists so the pull is
-        resumable after interruption.
+        Skips tickers whose output file already exists so the pull is resumable.
 
         Parameters
         ----------
@@ -59,6 +64,7 @@ class KalshiTradesPuller:
                     continue
 
                 bars = self._aggregate_hourly(df)
+                bars = self._add_log_odds(bars)
                 bars.to_parquet(out_path, index=False)
                 successes += 1
                 total_rows += len(bars)
@@ -75,7 +81,7 @@ class KalshiTradesPuller:
         print("--------------------------------\n")
 
     def _pull_ticker(self, ticker: str) -> pd.DataFrame:
-        """Fetch all trades for a single contract via paginated API calls.
+        """Fetch all trades for a single contract via paginated /trades calls.
 
         Parameters
         ----------
@@ -87,9 +93,8 @@ class KalshiTradesPuller:
         pd.DataFrame
             Raw tick data with columns from the API response.
         """
-        # Kalshi Elections API uses /markets/trades?ticker=X
         trades = self.client.get(
-            "/markets/trades",
+            "/trades",
             params={"ticker": ticker, "limit": 1000},
         )
         if not trades:
@@ -137,7 +142,6 @@ class KalshiTradesPuller:
         grouped = df.groupby("hour")
 
         def vwap(g: pd.DataFrame) -> float:
-            """Volume-weighted average price for one hourly group."""
             weights = g["count"].values.astype(float)
             prices = g["yes_price"].values.astype(float)
             total_w = weights.sum()
@@ -158,4 +162,33 @@ class KalshiTradesPuller:
         }).reset_index(drop=True)
 
         bars = bars.sort_values("timestamp").reset_index(drop=True)
+        return bars
+
+    @staticmethod
+    def _add_log_odds(bars: pd.DataFrame) -> pd.DataFrame:
+        """Apply log-odds transform and compute increments.
+
+        Steps:
+          1. Truncate p to [LOG_ODDS_CLIP_LO, LOG_ODDS_CLIP_HI] so that
+             log-odds remain finite.
+          2. X = log(p / (1 - p))
+          3. deltaX = X[t] - X[t-1]  (NaN for the first bar)
+
+        Adds columns: close_clipped, log_odds, delta_log_odds.
+
+        Parameters
+        ----------
+        bars : pd.DataFrame
+            Hourly OHLCV bars (must have a 'close' column in [0, 1]).
+
+        Returns
+        -------
+        pd.DataFrame
+            Same rows with three additional columns.
+        """
+        bars = bars.copy()
+        p = bars["close"].clip(config.LOG_ODDS_CLIP_LO, config.LOG_ODDS_CLIP_HI)
+        bars["close_clipped"] = p
+        bars["log_odds"] = np.log(p / (1.0 - p))
+        bars["delta_log_odds"] = bars["log_odds"].diff()
         return bars

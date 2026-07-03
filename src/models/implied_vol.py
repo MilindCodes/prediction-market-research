@@ -44,9 +44,9 @@ class ImpliedVolExtractor:
     STRIKE = 0.50
     RISK_FREE_RATE = 0.0
     SIGMA_LOWER = 1e-6
-    SIGMA_UPPER = 10.0
-    BOUNDARY_LOW = 0.02
-    BOUNDARY_HIGH = 0.98
+    SIGMA_UPPER = 20.0
+    BOUNDARY_LOW = 0.05
+    BOUNDARY_HIGH = 0.95
     FOMC_WINDOW_MINUTES = 30
 
     def __init__(self, close_time: pd.Timestamp,
@@ -138,10 +138,15 @@ class ImpliedVolExtractor:
         float
             Implied volatility sigma, or NaN if no solution exists.
         """
-        if T <= 0 or price <= 0 or price >= 1:
+        if T <= 0 or not (1e-6 < price < 1 - 1e-6):
             return np.nan
 
-        S = price
+        # S = 1.0 (normalized): price IS the contract value in [0,1].
+        # With S=1, K=0.5, r=0: V(sigma) = N(d2) is strictly decreasing from 1→0
+        # as sigma goes 0→∞, so brentq brackets for ALL prices in (0,1).
+        # Using S=price instead causes V→0 at both sigma extremes for price<0.5,
+        # which breaks bracketing and was responsible for the 86% NaN rate.
+        S = 1.0
         K = self.STRIKE
         r = self.RISK_FREE_RATE
 

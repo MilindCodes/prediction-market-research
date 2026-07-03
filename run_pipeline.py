@@ -43,10 +43,16 @@ def check():
 
     print()
     import config
-    if config.KALSHI_API_KEY:
-        print(f"  Kalshi API key: set ({config.KALSHI_API_KEY[:8]}...)")
+    if config.KALSHI_KEY_FILE:
+        print(f"  Kalshi RSA key file: {config.KALSHI_KEY_FILE}")
+        print(f"  Kalshi key ID: {config.KALSHI_KEY_ID or '(not set — also needed)'}")
+    elif config.KALSHI_API_KEY:
+        print(f"  Kalshi API key (Bearer): set ({config.KALSHI_API_KEY[:8]}...)")
     else:
-        print("  Kalshi API key: not set (OK — Kalshi Elections API is public for reads)")
+        print("  Kalshi auth: not set — set KALSHI_KEY_FILE + KALSHI_KEY_ID")
+        print("    (Download .pem from kalshi.com → Settings → API Keys)")
+        print("    export KALSHI_KEY_FILE=/path/to/kalshi-api-key.pem")
+        print("    export KALSHI_KEY_ID=<your-key-id>")
 
     if config.POLYMARKET_API_KEY:
         print(f"  Polymarket API key: set ({config.POLYMARKET_API_KEY[:8]}...)")
@@ -74,31 +80,34 @@ def check():
 
 
 def catalog_kalshi():
-    """Pull the Kalshi market catalog for 2025-2026 and apply filters.
+    """Pull the Kalshi market catalog for FOMC/CPI/economic events and apply filters.
 
-    NOTE: The Kalshi Elections API (api.elections.kalshi.com) only retains
-    data from ~2025 onwards. The 2022-2024 historical data was not preserved
-    when Kalshi migrated to this platform.
+    Targets FOMC rate decisions, CPI releases, PCE, GDP, and jobs reports.
+    Political/election markets are excluded.
 
-    This step collects 2025-2026 Kalshi data as a ROBUSTNESS CHECK for the
-    main Polymarket 2022-2024 analysis. Run catalog-polymarket first.
+    Set your API credentials before running:
+      export KALSHI_KEY_FILE=/path/to/kalshi-api-key.pem
+      export KALSHI_KEY_ID=<your-key-id>
     """
     import config
     from src.kalshi.client import KalshiClient
     from src.kalshi.catalog import KalshiCatalog
 
-    print("Connecting to Kalshi Elections API (public, no key needed)...")
     print(f"Targeting date range: {config.KALSHI_DATE_START} to {config.KALSHI_DATE_END}")
-    print("(Kalshi only has 2025-2026 data — primary elections + recent FOMC)\n")
+    print("Focus: FOMC, CPI, PCE, GDP, Jobs — political markets excluded\n")
 
-    client = KalshiClient(config.KALSHI_API_KEY)
+    client = KalshiClient(
+        api_key=config.KALSHI_API_KEY,
+        key_id=config.KALSHI_KEY_ID,
+        key_file=config.KALSHI_KEY_FILE,
+    )
     catalog = KalshiCatalog(client)
     df = catalog.pull_catalog()
 
-    print(f"\nDone. {len(df)} contracts passed the keyword and duration filters.")
+    print(f"\nDone. {len(df)} economic contracts passed keyword and duration filters.")
     print()
     print("Files created:")
-    print("  data/raw/kalshi/catalog_full.parquet     (every market on Kalshi)")
+    print("  data/raw/kalshi/catalog_full.parquet      (all pulled markets)")
     print("  data/raw/kalshi/catalog_filtered.parquet  (after applying filters)")
     print()
     print("Next step:")
@@ -151,7 +160,11 @@ def liquidity_kalshi():
     print("Filtering by volume (volume_fp >= 500).")
     print("No per-contract API calls needed — volume is included from the event pull.\n")
 
-    client = KalshiClient(config.KALSHI_API_KEY or "")
+    client = KalshiClient(
+        api_key=config.KALSHI_API_KEY,
+        key_id=config.KALSHI_KEY_ID,
+        key_file=config.KALSHI_KEY_FILE,
+    )
     catalog = KalshiCatalog(client)
     df = catalog.apply_liquidity_filter(df)
 
@@ -210,7 +223,11 @@ def trades_kalshi():
     print("Each contract gets its own file. Already-downloaded contracts are skipped.")
     print("This is the longest step — could take 30-60 minutes.\n")
 
-    client = KalshiClient(config.KALSHI_API_KEY or "")
+    client = KalshiClient(
+        api_key=config.KALSHI_API_KEY,
+        key_id=config.KALSHI_KEY_ID,
+        key_file=config.KALSHI_KEY_FILE,
+    )
     puller = KalshiTradesPuller(client)
     puller.pull(tickers)
 
@@ -681,6 +698,32 @@ def backtest_bates():
     print("  python run_pipeline.py compare")
 
 
+def clean():
+    """Clean raw and processed datasets and write results to data/clean/.
+
+    Three stages:
+      1. Trade OHLCV (Polymarket + Kalshi): drop NaN/out-of-range prices,
+         duplicates; flag stale price runs.
+      2. Implied vol: drop NaN sigma, T<=0, near-boundary, and extreme sigma
+         rows; discard contracts with fewer than 10 clean observations.
+      3. Calibration params: quality-flag Heston/Bates results for
+         non-convergence, Feller violations, and boundary-stuck parameters.
+
+    Original files in data/raw/ and data/processed/ are never modified.
+    Clean data lands in data/clean/ mirroring the existing structure.
+    """
+    from src.cleaning import DataCleaner
+
+    cleaner = DataCleaner()
+    cleaner.run()
+
+    print("Files created:")
+    print("  data/clean/polymarket/        — cleaned Polymarket OHLCV parquets")
+    print("  data/clean/kalshi/            — cleaned Kalshi OHLCV parquets")
+    print("  data/clean/implied_vol/       — cleaned IV parquets")
+    print("  data/clean/params_quality.csv — per-contract calibration quality flags")
+
+
 def compare():
     """Run model comparison across all calibrated contracts."""
     from analysis.model_comparison import ModelComparison
@@ -888,6 +931,7 @@ STEPS = {
     "compare": (compare, "Compare Heston vs Bates across all contracts"),
     "plots": (plots, "Generate all research figures"),
     "export": (export, "Export all results to CSV (open in Excel)"),
+    "clean": (clean, "Clean datasets and write quality flags to data/clean/"),
 }
 
 
@@ -921,6 +965,7 @@ def print_help():
     print(f"  10. {'compare':28s} Compare Heston vs Bates (MSE, AIC, BIC, QLIKE)")
     print(f"  11. {'plots':28s} Generate all figures for the paper")
     print(f"  12. {'export':28s} Export everything to CSV (open in Excel)")
+    print(f"  13. {'clean':28s} Clean datasets, flag degenerate fits → data/clean/")
     print()
     print("Start with:  python run_pipeline.py check")
 

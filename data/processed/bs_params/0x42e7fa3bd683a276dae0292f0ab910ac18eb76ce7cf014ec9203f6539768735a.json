@@ -1,0 +1,9 @@
+{
+  "ticker": "0x42e7fa3bd683a276dae0292f0ab910ac18eb76ce7cf014ec9203f6539768735a",
+  "platform": "polymarket",
+  "sigma_bs": 5.193688937968571,
+  "mse": 1319.683032523804,
+  "log_likelihood": -1162.6707754483386,
+  "n_obs": 232,
+  "converged": true
+}
