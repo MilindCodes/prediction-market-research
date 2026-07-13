@@ -220,6 +220,20 @@ class NestedLadder:
             cache = self.calibrator.prepare(sub)
             lr = self._fit_one_kappa(cache, kappa, verbose=verbose)
             out[series] = lr
+
+        rows = []
+        for series, lr in out.items():
+            for res in [lr.constant_vol, lr.heston, lr.bates, lr.merton]:
+                rows.append({
+                    "family": series, "kappa": lr.kappa, "model": res.model,
+                    "sigma_v": res.sigma_v, "sigma_J": res.sigma_J,
+                    "j_stat": res.j_stat, "j_dof": res.j_dof,
+                    "j_pvalue": res.j_pvalue, "n_real": res.n_real,
+                })
+        df = pd.DataFrame(rows)
+        out_path = config.DATA_DIR / "processed" / "smm_family_split.csv"
+        df.to_csv(out_path, index=False, float_format="%.6f")
+        print(f"\nFamily split results saved: {out_path}")
         return out
 
     def validate_loop(
