@@ -4,9 +4,12 @@
 Produces the tidy long panel (contract_id, t, p, X, delta_X) that
 §4.2 and §4.3 consume.
 
-If per-contract hourly-bar parquets already exist under data/raw/kalshi/,
+If per-contract daily-bar parquets already exist under data/raw/polymarket/,
 the builder reads them directly (VWAP close is used; functionally
-indistinguishable from last-trade for hourly bars on a sparse market).
+indistinguishable from last-trade for daily bars on a sparse market).
+The grid is daily because the CLOB prices-history endpoint only retains
+daily (fidelity=1440) granularity for closed markets — an hourly grid
+would forward-fill ~24 artificial zero-increments per real observation.
 
 If a contract's parquet is missing and a KalshiClient is provided,
 the builder falls back to a fresh pull that routes settled contracts to
@@ -28,7 +31,7 @@ except ImportError:
 
 CLIP_LO: float = config.LOG_ODDS_CLIP_LO
 CLIP_HI: float = config.LOG_ODDS_CLIP_HI
-GRID_FREQ = "h"
+GRID_FREQ = "D"
 
 
 class SMMPanelBuilder:
@@ -58,7 +61,7 @@ class SMMPanelBuilder:
     ):
         self.client = client
         self.data_dir = data_dir or config.DATA_DIR
-        self.raw_dir = self.data_dir / "raw" / "kalshi"
+        self.raw_dir = self.data_dir / "raw" / "polymarket"
         self.processed_dir = self.data_dir / "processed"
         self.processed_dir.mkdir(parents=True, exist_ok=True)
         self.freq = freq
@@ -142,13 +145,25 @@ class SMMPanelBuilder:
     # ------------------------------------------------------------------
 
     def _load_catalog_tickers(self) -> list[str]:
+        # Prefer the per-contract parquets already pulled to raw_dir: the
+        # filenames are the condition IDs, and (unlike the scraped catalog)
+        # they are guaranteed to have price data behind them.
+        pulled = sorted(
+            p.stem for p in self.raw_dir.glob("0x*.parquet")
+        )
+        if pulled:
+            return pulled
+
         cat_path = self.raw_dir / "catalog_filtered.parquet"
         if not cat_path.exists():
-            print("  WARNING: catalog_filtered.parquet not found — "
-                  "run 'catalog-kalshi' step first.")
+            print("  WARNING: no pulled contracts and no "
+                  "catalog_filtered.parquet — run the catalog step first.")
             return []
         df = pd.read_parquet(cat_path)
-        return df["ticker"].tolist() if "ticker" in df.columns else []
+        for col in ("ticker", "conditionId"):
+            if col in df.columns:
+                return df[col].tolist()
+        return []
 
     def _load_or_pull(self, ticker: str) -> pd.DataFrame | None:
         """Return hourly-bar DataFrame for one ticker."""
@@ -247,6 +262,12 @@ class SMMPanelBuilder:
         if bars.empty:
             return None
 
+        # Snap bar timestamps onto the grid before reindexing — raw bars can
+        # carry second-level offsets (e.g. 00:00:02) that would otherwise
+        # miss every grid point and drop the whole contract.
+        bars["time"] = bars["time"].dt.floor(self.freq)
+        bars = bars.groupby("time", as_index=False).last()
+
         # Complete hourly grid and forward-fill within contract life
         t_start = bars["time"].iloc[0].floor(self.freq)
         t_end = bars["time"].iloc[-1].ceil(self.freq)
@@ -279,6 +300,7 @@ class SMMPanelBuilder:
         out = pd.DataFrame({
             "contract_id": ticker,
             "t": np.arange(len(bars)),
+            "p_raw": p_raw,   # unclipped — kept so truncation sensitivity can re-clip
             "p": p,
             "X": X,
             "delta_X": delta_X,

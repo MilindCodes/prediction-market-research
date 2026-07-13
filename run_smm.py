@@ -176,8 +176,9 @@ def step_validate_model(model: str = "Bates") -> None:
 
 
 def step_split() -> None:
-    """§4.8  FOMC-vs-CPI robustness split."""
-    print("\n=== Step: split (FOMC vs CPI) ===")
+    """§4.8  Contract-family robustness split (Fed vs Election on
+    Polymarket; FOMC vs CPI on Kalshi)."""
+    print("\n=== Step: split (contract families) ===")
     import pandas as pd
     from src.smm.bates_smm import BatesSMM
     from src.smm.nested_ladder import NestedLadder
@@ -233,13 +234,13 @@ def step_trunc_sensitivity(kappa: float = 5.0) -> None:
 
 
 def step_freq_sensitivity(kappa: float = 5.0) -> None:
-    """§4.8  Frequency sensitivity: 1h vs 2h vs 4h grid."""
+    """§4.8  Frequency sensitivity: daily vs 2-day vs 4-day grid."""
     print("\n=== Step: freq-sensitivity ===")
     from src.smm.bates_smm import BatesSMM
     from src.smm.nested_ladder import frequency_sensitivity
 
     cal = BatesSMM(n_sim_multiplier=20, n_bootstrap=300, n_restarts=3)
-    frequency_sensitivity(calibrator=cal, kappa=kappa, freqs=["1h", "2h", "4h"])
+    frequency_sensitivity(calibrator=cal, kappa=kappa, freqs=["D", "2D", "4D"])
 
 
 def step_bucketing(kappa: float = 5.0) -> None:
@@ -267,9 +268,9 @@ STEPS = {
     "ladder":             ("§4.4  Full nested ladder",                          step_ladder),
     "validate-model":     ("§4.7  Validation loop (simulate selected model)",   step_validate_model),
     "select":             ("§4.6  Which moments do the selecting",              step_select),
-    "split":              ("§4.8  FOMC-vs-CPI robustness split",               step_split),
+    "split":              ("§4.8  Contract-family robustness split",           step_split),
     "trunc-sensitivity":  ("§4.8  Truncation sensitivity [0.02,0.98] vs [0.01,0.99]", step_trunc_sensitivity),
-    "freq-sensitivity":   ("§4.8  Frequency sensitivity 1h/2h/4h",             step_freq_sensitivity),
+    "freq-sensitivity":   ("§4.8  Frequency sensitivity D/2D/4D",              step_freq_sensitivity),
     "bucketing":          ("§4.8  Cross-sectional bucketing by contract length", step_bucketing),
 }
 

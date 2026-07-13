@@ -187,10 +187,31 @@ class NestedLadder:
         kappa: float = 5.0,
         verbose: bool = True,
     ) -> dict[str, LadderResult]:
-        """§4.8 robustness: run ladder separately for FOMC and CPI contracts."""
+        """§4.8 robustness: run ladder separately per contract family.
+
+        Kalshi tickers split by prefix (KXFED / KXCPI).  Polymarket condition
+        IDs (0x…) are classified via the identity mapping in
+        data/exports/polymarket_contract_identities.csv (fed vs election),
+        since Polymarket carries no CPI markets.
+        """
         out: dict[str, LadderResult] = {}
-        for series, prefix in [("FOMC", "KXFED"), ("CPI", "KXCPI")]:
-            sub = panel[panel["contract_id"].str.startswith(prefix)]
+        ids = panel["contract_id"].astype(str)
+
+        if ids.str.startswith("0x").all():
+            id_path = Path("data/exports/polymarket_contract_identities.csv")
+            groups = pd.read_csv(id_path).set_index("conditionId")["group"]
+            splits = [
+                ("Fed", ids.map(groups).eq("fed")),
+                ("Election", ids.map(groups).eq("election")),
+            ]
+        else:
+            splits = [
+                ("FOMC", ids.str.startswith("KXFED")),
+                ("CPI", ids.str.startswith("KXCPI")),
+            ]
+
+        for series, mask in splits:
+            sub = panel[mask]
             if len(sub) < 50:
                 print(f"  Skipping {series}: only {len(sub)} rows")
                 continue
@@ -590,9 +611,12 @@ def truncation_sensitivity(
         label = f"[{clip_lo},{clip_hi}]"
         print(f"\n--- Truncation sensitivity {label} ---")
 
-        # Re-apply clip/logit/diff to the base panel's raw p column
+        # Re-apply clip/logit/diff to the base panel's raw p column.
+        # p_raw is the unclipped price — clipping the already-clipped p
+        # column would make every clip pair a no-op.
         panel = panel_base.copy()
-        p_re = np.clip(panel["p"].values, clip_lo, clip_hi)
+        src_col = "p_raw" if "p_raw" in panel.columns else "p"
+        p_re = np.clip(panel[src_col].values, clip_lo, clip_hi)
         X_re = np.log(p_re / (1.0 - p_re))
 
         # Recompute delta_X within each contract
@@ -638,15 +662,17 @@ def frequency_sensitivity(
 ) -> pd.DataFrame:
     """§4.8 — Re-run panel and SMM at alternative grid frequencies.
 
-    Compares hourly (1h) baseline against coarser grids (2h, 4h).
+    Compares the daily (D) baseline against coarser grids (2D, 4D).
     Coarser grids have fewer forward-filled zero-increments but also
     less data — the sensitivity checks that results are stable.
+    (The raw bars are daily, so grids finer than 1D would only add
+    forward-filled artifacts.)
     """
     from src.smm.panel import SMMPanelBuilder
 
-    raw_dir    = raw_dir or (config.DATA_DIR / "raw" / "kalshi")
+    raw_dir    = raw_dir or (config.DATA_DIR / "raw" / "polymarket")
     calibrator = calibrator or BatesSMM()
-    freqs      = freqs or ["1h", "2h", "4h"]
+    freqs      = freqs or ["D", "2D", "4D"]
 
     rows = []
     for freq in freqs:
