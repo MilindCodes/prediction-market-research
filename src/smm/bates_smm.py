@@ -9,12 +9,24 @@ Model (log-odds space, Δt = 1):
 
 Parameter schedule
 ------------------
-κ : fixed — caller supplies value from grid {1, 5, 10}
+κ : FREE in the main selection run (shared spec across the ladder).  κ only
+    enters the simulator through σ_v·√v, so it is identified in Heston and
+    Bates and irrelevant (v ≡ θ) in ConstantVol and Merton.  §4.8 re-runs
+    the ladder with κ fixed on the grid {1, 5, 10} as a robustness check.
 ρ : fixed — 0 (baseline)
 θ : fixed — Var(ΔX) / Δt  (with Δt=1: θ = sample variance of increments)
 λ : fixed — fraction of |ΔX| > 3·SD (rough jump frequency)
 σ_v : FREE — optimizer
 σ_J : FREE — optimizer
+
+Nesting guarantee
+-----------------
+Each model is warm-started at the optimum of the model it nests (Heston at
+ConstantVol with σ_v=0; Bates at Heston with σ_J=0 and at Merton with
+σ_v=0), so a richer model can never end at a worse objective than the
+model it nests — worst case it stays at the warm start.  For this to hold
+exactly, ConstantVol is scored by SIMULATION at (σ_v=0, σ_J=0) with the
+shared CRN draws, not analytically.
 
 Five moments (computed once on pooled, demeaned real increments)
   [0] Var(ΔX)
@@ -59,6 +71,9 @@ MOMENT_LABELS = [
 ]
 N_MOMENTS = len(MOMENT_LABELS)
 LARGE_PENALTY = 1e9
+# Upper bound for free κ — twice the top of the {1,5,10} robustness grid;
+# unbounded κ lets Nelder-Mead wander into Euler-unstable territory.
+KAPPA_MAX = 20.0
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +102,9 @@ class SMMResult:
     # Inference
     se_sigma_v: float = np.nan
     se_sigma_J: float = np.nan
+    se_kappa: float = np.nan
     # Book-keeping
+    kappa_free: bool = False
     n_real: int = 0
     n_sim: int = 0
     n_free: int = 2
@@ -256,12 +273,16 @@ class BatesSMM:
         kappa: float = 5.0,
         rho: float = 0.0,
         verbose: bool = True,
+        free_kappa: bool = False,
+        warm_starts: "list[np.ndarray] | None" = None,
     ) -> SMMResult:
-        """Fit Bates (σ_v and σ_J both free)."""
+        """Fit Bates (σ_v and σ_J free; κ free too when free_kappa)."""
+        free = ("sigma_v", "sigma_J", "kappa") if free_kappa \
+            else ("sigma_v", "sigma_J")
         return self._fit(
             cache, kappa=kappa, rho=rho,
-            model="Bates", free=("sigma_v", "sigma_J"),
-            verbose=verbose,
+            model="Bates", free=free,
+            warm_starts=warm_starts, verbose=verbose,
         )
 
     def fit_heston(
@@ -270,12 +291,15 @@ class BatesSMM:
         kappa: float = 5.0,
         rho: float = 0.0,
         verbose: bool = True,
+        free_kappa: bool = False,
+        warm_starts: "list[np.ndarray] | None" = None,
     ) -> SMMResult:
-        """Fit Heston (σ_v free, σ_J = 0)."""
+        """Fit Heston (σ_v free, σ_J = 0; κ free too when free_kappa)."""
+        free = ("sigma_v", "kappa") if free_kappa else ("sigma_v",)
         return self._fit(
             cache, kappa=kappa, rho=rho,
-            model="Heston", free=("sigma_v",),
-            verbose=verbose,
+            model="Heston", free=free,
+            warm_starts=warm_starts, verbose=verbose,
         )
 
     def fit_merton(
@@ -284,12 +308,17 @@ class BatesSMM:
         kappa: float = 5.0,
         rho: float = 0.0,
         verbose: bool = True,
+        warm_starts: "list[np.ndarray] | None" = None,
     ) -> SMMResult:
-        """Fit Merton jump-diffusion (σ_J free, σ_v = 0)."""
+        """Fit Merton jump-diffusion (σ_J free, σ_v = 0).
+
+        κ is never free here: with σ_v = 0 the variance stays at θ and κ
+        drops out of the model entirely.
+        """
         return self._fit(
             cache, kappa=kappa, rho=rho,
             model="Merton", free=("sigma_J",),
-            verbose=verbose,
+            warm_starts=warm_starts, verbose=verbose,
         )
 
     def fit_constant_vol(
@@ -299,21 +328,26 @@ class BatesSMM:
         rho: float = 0.0,
         verbose: bool = True,
     ) -> SMMResult:
-        """Evaluate constant-vol diffusion (no free params, analytical moments)."""
+        """Evaluate constant-vol diffusion (no free params).
+
+        Moments are SIMULATED at (σ_v=0, σ_J=0) with the shared CRN draws —
+        not the analytical N(0, θ) values — so ConstantVol is exactly the
+        σ_v=0 restriction of Heston under the same simulator.  Analytical
+        moments would break the J(CV) ≥ J(Heston) nesting guarantee by the
+        sampling noise of the CRN draws.  (κ is recorded but inert: σ_v=0
+        pins v ≡ θ.)
+        """
         m_real  = cache["m_real"]
         W       = cache["W"]
         theta   = cache["theta"]
+        lambda_ = cache["lambda_"]
         n_real  = cache["n_real"]
         n_sim   = cache["n_sim"]
+        randoms = cache["randoms"]
 
-        # Analytical moments for N(0, θ): var=θ, kurt=0, acf=0, p95=1.6449·√θ
-        m_sim = np.array([
-            theta,
-            0.0,
-            0.0,
-            0.0,
-            1.6449 * theta ** 0.5,
-        ])
+        m_sim = self._simulate_moments(
+            0.0, 0.0, kappa, theta, lambda_, rho, n_sim, randoms
+        )
         g = m_sim - m_real
         obj = float(g @ W @ g)
         j_stat, j_p = _j_test(g, W, n_real, n_sim, dof=N_MOMENTS)  # 5 restrictions
@@ -325,7 +359,7 @@ class BatesSMM:
         return SMMResult(
             model="ConstantVol",
             kappa=kappa, theta=theta, rho=rho,
-            lambda_=0.0, sigma_v=0.0, sigma_J=0.0,
+            lambda_=lambda_, sigma_v=0.0, sigma_J=0.0,
             moments_real=m_real, moments_sim=m_sim,
             objective_value=obj,
             j_stat=j_stat, j_dof=N_MOMENTS, j_pvalue=j_p,
@@ -337,12 +371,15 @@ class BatesSMM:
         result: SMMResult,
         cache: dict,
         h_frac: float = 1e-3,
-    ) -> tuple[float, float]:
-        """Finite-difference Jacobian → asymptotic SEs for σ_v and σ_J.
+    ) -> tuple[float, float, float]:
+        """Finite-difference Jacobian → asymptotic SEs for the free params.
 
         avar(θ̂) = (G'WG)⁻¹  [simplified: assuming W ≈ Ω⁻¹]
 
-        Returns (se_sigma_v, se_sigma_J); nan if parameter not free.
+        κ is included in the Jacobian when the fit had κ free, so the σ
+        SEs are not conditional on a fixed κ.
+
+        Returns (se_sigma_v, se_sigma_J, se_kappa); nan if not free.
         """
         W       = cache["W"]
         randoms = cache["randoms"]
@@ -357,16 +394,17 @@ class BatesSMM:
 
         model = result.model
         if model == "Bates":
-            free_vals = np.array([sv, sJ])
             free_names = ["sigma_v", "sigma_J"]
         elif model == "Heston":
-            free_vals = np.array([sv])
             free_names = ["sigma_v"]
         elif model == "Merton":
-            free_vals = np.array([sJ])
             free_names = ["sigma_J"]
         else:
-            return np.nan, np.nan
+            return np.nan, np.nan, np.nan
+        if result.kappa_free:
+            free_names.append("kappa")
+        base = {"sigma_v": sv, "sigma_J": sJ, "kappa": kappa}
+        free_vals = np.array([base[n] for n in free_names])
 
         n_free = len(free_vals)
         G = np.zeros((N_MOMENTS, n_free))
@@ -395,7 +433,8 @@ class BatesSMM:
 
         se_sv = ses[free_names.index("sigma_v")] if "sigma_v" in free_names else np.nan
         se_sJ = ses[free_names.index("sigma_J")] if "sigma_J" in free_names else np.nan
-        return se_sv, se_sJ
+        se_k  = ses[free_names.index("kappa")]   if "kappa" in free_names else np.nan
+        return se_sv, se_sJ, se_k
 
     # ------------------------------------------------------------------
     # Internal: unified optimiser
@@ -409,6 +448,7 @@ class BatesSMM:
         model: str,
         free: tuple[str, ...],
         verbose: bool,
+        warm_starts: "list[np.ndarray] | None" = None,
     ) -> SMMResult:
         m_real  = cache["m_real"]
         W       = cache["W"]
@@ -422,14 +462,20 @@ class BatesSMM:
         n_free = len(free)
         j_dof  = N_MOMENTS - n_free
 
-        # Starting points
-        x0_pool = self._starting_points(free, sd_real)
+        # Starting points: warm starts (the nested model's optimum) always
+        # run first and are never dropped by the restart budget — they are
+        # what guarantees the richer model can't end worse than the model
+        # it nests.
+        x0_pool = (
+            [np.asarray(w, dtype=float) for w in (warm_starts or [])]
+            + self._starting_points(free, sd_real)[: self.n_restarts]
+        )
 
         best_x   = x0_pool[0]
         best_val = np.inf
         best_sim_moments = compute_moments(np.zeros(10))
 
-        for i, x0 in enumerate(x0_pool[: self.n_restarts]):
+        for i, x0 in enumerate(x0_pool):
             try:
                 res = optimize.minimize(
                     self._objective,
@@ -461,25 +507,29 @@ class BatesSMM:
             if "sigma_v" in free else 0.0
         sJ_hat = abs(float(best_x[free.index("sigma_J")])) \
             if "sigma_J" in free else 0.0
+        kap_hat = abs(float(best_x[free.index("kappa")])) \
+            if "kappa" in free else kappa
 
         m_sim = self._simulate_moments(
-            sv_hat, sJ_hat, kappa, theta, lambda_, rho, n_sim, randoms
+            sv_hat, sJ_hat, kap_hat, theta, lambda_, rho, n_sim, randoms
         )
         g = m_sim - m_real
         j_stat, j_p = _j_test(g, W, n_real, n_sim, dof=j_dof)
 
         if verbose:
-            print(f"  [{model}] → σ_v={sv_hat:.4f}, σ_J={sJ_hat:.4f}, "
+            kap_note = f", κ={kap_hat:.4f}" if "kappa" in free else ""
+            print(f"  [{model}] → σ_v={sv_hat:.4f}, σ_J={sJ_hat:.4f}{kap_note}, "
                   f"J={j_stat:.3f} (χ²({j_dof}), p={j_p:.3f})")
 
         return SMMResult(
             model=model,
-            kappa=kappa, theta=theta, rho=rho,
+            kappa=kap_hat, theta=theta, rho=rho,
             lambda_=lambda_,
             sigma_v=sv_hat, sigma_J=sJ_hat,
             moments_real=m_real, moments_sim=m_sim,
             objective_value=best_val,
             j_stat=j_stat, j_dof=j_dof, j_pvalue=j_p,
+            kappa_free=("kappa" in free),
             n_real=n_real, n_sim=n_sim, n_free=n_free,
         )
 
@@ -496,14 +546,20 @@ class BatesSMM:
         m_real: np.ndarray,
         W: np.ndarray,
     ) -> float:
-        for v in x:
-            if v <= 0:
+        # σ_v = 0 and σ_J = 0 are legitimate boundary values (they ARE the
+        # nested restrictions), so only negatives are penalised.  κ must be
+        # strictly positive and bounded — see KAPPA_MAX.
+        for name, v in zip(free, x):
+            if v < 0:
+                return LARGE_PENALTY
+            if name == "kappa" and (v <= 0 or v > KAPPA_MAX):
                 return LARGE_PENALTY
 
-        sv = x[free.index("sigma_v")] if "sigma_v" in free else 0.0
-        sJ = x[free.index("sigma_J")] if "sigma_J" in free else 0.0
+        sv  = x[free.index("sigma_v")] if "sigma_v" in free else 0.0
+        sJ  = x[free.index("sigma_J")] if "sigma_J" in free else 0.0
+        kap = x[free.index("kappa")]   if "kappa" in free else kappa
 
-        m_sim = self._simulate_moments(sv, sJ, kappa, theta, lambda_, rho,
+        m_sim = self._simulate_moments(sv, sJ, kap, theta, lambda_, rho,
                                        n_sim, randoms)
         if np.any(np.isnan(m_sim)):
             return LARGE_PENALTY
@@ -545,7 +601,9 @@ class BatesSMM:
             if "sigma_v" in free_names else sv_base
         sJ = abs(float(free_vals[free_names.index("sigma_J")])) \
             if "sigma_J" in free_names else sJ_base
-        return self._simulate_moments(sv, sJ, kappa, theta, lambda_, rho,
+        kap = abs(float(free_vals[free_names.index("kappa")])) \
+            if "kappa" in free_names else kappa
+        return self._simulate_moments(sv, sJ, kap, theta, lambda_, rho,
                                       n_sim, randoms)
 
     # ------------------------------------------------------------------
@@ -583,17 +641,15 @@ class BatesSMM:
     def _starting_points(
         self, free: tuple[str, ...], sd_real: float
     ) -> list[np.ndarray]:
-        candidates = []
-        sv_guesses = [0.3, 0.1, 0.6]
-        sJ_guesses = [2.0 * sd_real, sd_real, 3.0 * sd_real]
-        for sv_g, sJ_g in zip(sv_guesses, sJ_guesses):
-            x0 = np.array([
-                sv_g if "sigma_v" in free else sJ_g
-                if len(free) == 1 and "sigma_J" in free
-                else sv_g
-            ] if len(free) == 1 else [sv_g, sJ_g])
-            candidates.append(x0)
-        return candidates
+        guesses = {
+            "sigma_v": [0.3, 0.1, 0.6],
+            "sigma_J": [2.0 * sd_real, sd_real, 3.0 * sd_real],
+            "kappa":   [5.0, 1.0, 10.0],
+        }
+        return [
+            np.array([guesses[name][i] for name in free])
+            for i in range(3)
+        ]
 
 
 # ---------------------------------------------------------------------------

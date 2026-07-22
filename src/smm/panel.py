@@ -152,7 +152,7 @@ class SMMPanelBuilder:
             p.stem for p in self.raw_dir.glob("0x*.parquet")
         )
         if pulled:
-            return pulled
+            return self._drop_excluded_groups(pulled)
 
         cat_path = self.raw_dir / "catalog_filtered.parquet"
         if not cat_path.exists():
@@ -164,6 +164,24 @@ class SMMPanelBuilder:
             if col in df.columns:
                 return df[col].tolist()
         return []
+
+    def _drop_excluded_groups(self, tickers: list[str]) -> list[str]:
+        """Drop contracts excluded from the §4 corpus.
+
+        Election markets were cut from the corpus (July 2026) — the panel is
+        Fed-only.  Classification comes from the verified identity mapping;
+        contracts absent from the mapping are kept.
+        """
+        id_path = self.data_dir / "exports" / "polymarket_contract_identities.csv"
+        if not id_path.exists():
+            return tickers
+        groups = pd.read_csv(id_path).set_index("conditionId")["group"]
+        kept = [t for t in tickers if groups.get(t) != "election"]
+        n_dropped = len(tickers) - len(kept)
+        if n_dropped:
+            print(f"  Corpus filter: dropped {n_dropped} election contracts "
+                  f"({len(kept)} remain)")
+        return kept
 
     def _load_or_pull(self, ticker: str) -> pd.DataFrame | None:
         """Return hourly-bar DataFrame for one ticker."""

@@ -114,10 +114,11 @@ def step_calibrate(kappa: float = 5.0) -> None:
     panel = pd.read_parquet("data/processed/smm_panel.parquet")
     cal = BatesSMM(n_sim_multiplier=20, n_bootstrap=300, n_restarts=3)
     cache = cal.prepare(panel)
-    result = cal.fit_bates(cache, kappa=kappa, verbose=True)
+    result = cal.fit_bates(cache, kappa=kappa, free_kappa=True, verbose=True)
 
-    print(f"\nBates fit (κ={kappa}):")
-    print(f"  σ_v = {result.sigma_v:.4f}  σ_J = {result.sigma_J:.4f}")
+    print(f"\nBates fit (κ free, init {kappa}):")
+    print(f"  σ_v = {result.sigma_v:.4f}  σ_J = {result.sigma_J:.4f}  "
+          f"κ̂ = {result.kappa:.4f}")
     print(f"  J   = {result.j_stat:.3f}  (χ²({result.j_dof}), p={result.j_pvalue:.3f})")
     print("\nMoment fit:")
     for label, real, sim in zip(
@@ -132,8 +133,8 @@ def step_ladder(
     n_sim_multiplier: int = 20,
     n_bootstrap: int = 400,
     n_restarts: int = 3,
-) -> list:
-    """§4.4  Full nested ladder across κ grid."""
+) -> tuple:
+    """§4.4  Selection run (κ free) + §4.8 fixed-κ robustness grid."""
     print("\n=== Step: ladder ===")
     import pandas as pd
     from src.smm.bates_smm import BatesSMM
@@ -148,8 +149,9 @@ def step_ladder(
         n_restarts=n_restarts,
     )
     ladder = NestedLadder(calibrator=cal, kappa_grid=kappa_grid)
-    results = ladder.run(panel, verbose=True)
-    return results
+    main = ladder.run_selection(panel, verbose=True)   # §4.4 — the result
+    grid = ladder.run(panel, verbose=True)             # §4.8 — robustness
+    return main, grid
 
 
 def step_validate_model(model: str = "Bates") -> None:
@@ -161,10 +163,9 @@ def step_validate_model(model: str = "Bates") -> None:
 
     panel = pd.read_parquet("data/processed/smm_panel.parquet")
     cal = BatesSMM(n_sim_multiplier=20, n_bootstrap=300, n_restarts=2)
-    ladder = NestedLadder(calibrator=cal, kappa_grid=[5.0])
-    results = ladder.run(panel, verbose=True)
+    ladder = NestedLadder(calibrator=cal)
+    lr = ladder.run_selection(panel, verbose=True)
 
-    lr = results[0]
     selected = {
         "Bates":       lr.bates,
         "Heston":      lr.heston,
@@ -176,8 +177,9 @@ def step_validate_model(model: str = "Bates") -> None:
 
 
 def step_split() -> None:
-    """§4.8  Contract-family robustness split (Fed vs Election on
-    Polymarket; FOMC vs CPI on Kalshi)."""
+    """§4.8  Contract-family robustness split (families present in the
+    identity mapping; FOMC vs CPI on Kalshi).  With a single family in the
+    corpus this reduces to the main run."""
     print("\n=== Step: split (contract families) ===")
     import pandas as pd
     from src.smm.bates_smm import BatesSMM
@@ -185,8 +187,8 @@ def step_split() -> None:
 
     panel = pd.read_parquet("data/processed/smm_panel.parquet")
     cal = BatesSMM(n_sim_multiplier=20, n_bootstrap=300, n_restarts=2)
-    ladder = NestedLadder(calibrator=cal, kappa_grid=[5.0])
-    results = ladder.run_fomc_cpi_split(panel, kappa=5.0, verbose=True)
+    ladder = NestedLadder(calibrator=cal)
+    results = ladder.run_family_split(panel, verbose=True)
 
     for name, lr in results.items():
         print(f"\n  {name}:  σ_v(B)={lr.bates.sigma_v:.4f}  "
@@ -203,7 +205,7 @@ def step_identify(kappa: float = 5.0) -> None:
     panel = pd.read_parquet("data/processed/smm_panel.parquet")
     cal   = BatesSMM(n_sim_multiplier=20, n_bootstrap=300, n_restarts=3)
     cache = cal.prepare(panel)
-    result = cal.fit_bates(cache, kappa=kappa, verbose=True)
+    result = cal.fit_bates(cache, kappa=kappa, free_kappa=True, verbose=True)
     identification_check(result, cache, h_frac=0.20)
 
 
@@ -216,9 +218,9 @@ def step_select(kappa: float = 5.0) -> None:
 
     panel  = pd.read_parquet("data/processed/smm_panel.parquet")
     cal    = BatesSMM(n_sim_multiplier=20, n_bootstrap=300, n_restarts=3)
-    ladder = NestedLadder(calibrator=cal, kappa_grid=[kappa])
-    results = ladder.run(panel, verbose=True)
-    moment_selection_analysis(results[0])
+    ladder = NestedLadder(calibrator=cal, kappa_init=kappa)
+    lr = ladder.run_selection(panel, verbose=True)
+    moment_selection_analysis(lr)
 
 
 def step_trunc_sensitivity(kappa: float = 5.0) -> None:
@@ -263,9 +265,9 @@ STEPS = {
     "panel":              ("§4.1  Build SMM panel",                             step_panel),
     "validate-syn":       ("§4.2  Synthetic validation",                        step_validate_synthetic),
     "stylized":           ("§4.2  Stylized facts on real data",                 step_stylized),
-    "calibrate":          ("§4.3  Bates SMM quick check (κ=5)",                lambda: step_calibrate(kappa=5.0)),
+    "calibrate":          ("§4.3  Bates SMM quick check (κ free)",             lambda: step_calibrate(kappa=5.0)),
     "identify":           ("§4.3  Identification check (σ_v vs σ_J moments)",   step_identify),
-    "ladder":             ("§4.4  Full nested ladder",                          step_ladder),
+    "ladder":             ("§4.4  Selection run (κ free) + §4.8 κ grid",       step_ladder),
     "validate-model":     ("§4.7  Validation loop (simulate selected model)",   step_validate_model),
     "select":             ("§4.6  Which moments do the selecting",              step_select),
     "split":              ("§4.8  Contract-family robustness split",           step_split),

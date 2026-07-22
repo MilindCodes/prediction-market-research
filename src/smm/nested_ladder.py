@@ -17,6 +17,17 @@ Because simpler models are nested, we get:
 SAME weighting matrix W must be used for all models.
 The W is built once inside BatesSMM.prepare() and shared.
 
+Each model is warm-started at the optimum of the model it nests, so
+J_restricted ≥ J_full holds by construction; diff_j_test raises if it
+doesn't (that is a fitting bug, not a result).
+
+Main selection run (§4.4)
+-------------------------
+κ is FREE and shared across the ladder (it enters only where σ_v > 0, so
+it is estimated by Heston/Bates and inert in ConstantVol/Merton).  Pinning
+κ to a grid value pushed different models to differently-misspecified
+spots and produced impossible orderings (Heston worse than ConstantVol).
+
 Standard errors (§4.5)
 -----------------------
 avar(θ̂) = (G'WG)⁻¹  (simplified; uses bootstrap W ≈ efficient matrix)
@@ -24,7 +35,8 @@ G = ∂m_sim/∂θ by central finite differences.
 
 Robustness (§4.8)
 -----------------
-Run the full ladder for each κ ∈ {1, 5, 10} and report stability.
+Re-run the full ladder with κ fixed at each of {1, 5, 10} and report
+stability of the selection verdicts.
 """
 from __future__ import annotations
 
@@ -85,6 +97,18 @@ def diff_j_test(restricted: SMMResult, full: SMMResult) -> DiffJResult:
             f"{full.model}({full.n_free}) vs {restricted.model}({restricted.n_free})"
         )
     diff = restricted.j_stat - full.j_stat
+    # The full model nests the restricted one and is warm-started at its
+    # optimum, so J_restricted ≥ J_full must hold (up to float dust).  If it
+    # doesn't, the fit is broken — refuse to print a p-value we'd retract.
+    tol = 1e-6 * max(1.0, abs(restricted.j_stat))
+    if diff < -tol:
+        raise AssertionError(
+            f"J_restricted < J_full: {restricted.model} J={restricted.j_stat:.6f} "
+            f"vs {full.model} J={full.j_stat:.6f} (ΔJ={diff:.3e}). "
+            f"The {full.model} optimizer failed to reach the {restricted.model} "
+            f"optimum it nests — fitting bug, not a result. Check warm starts "
+            f"and the shared W."
+        )
     p = float(1.0 - stats.chi2.cdf(max(diff, 0.0), df=delta_dof))
     return DiffJResult(
         restricted=restricted.model,
@@ -104,7 +128,7 @@ def diff_j_test(restricted: SMMResult, full: SMMResult) -> DiffJResult:
 
 @dataclass
 class LadderResult:
-    kappa: float
+    kappa: float            # grid value (fixed-κ runs) or κ init (free-κ run)
     constant_vol: SMMResult
     heston: SMMResult
     bates: SMMResult
@@ -112,6 +136,7 @@ class LadderResult:
     test_sv: DiffJResult    # ConstantVol vs Heston — need for stochastic vol?
     test_jumps: DiffJResult # Heston vs Bates      — need for jumps?
     moment_table: pd.DataFrame
+    free_kappa: bool = False
 
 
 class NestedLadder:
@@ -122,7 +147,9 @@ class NestedLadder:
     calibrator : BatesSMM
         Pre-configured calibrator (controls n_sim, bootstrap, restarts).
     kappa_grid : list[float]
-        Mean-reversion speeds to iterate over (§4.8 robustness).
+        Mean-reversion speeds for the §4.8 fixed-κ robustness grid.
+    kappa_init : float
+        Optimizer starting value for κ in the free-κ selection run.
     rho : float
         Correlation parameter (fixed at 0 per baseline spec).
     figures_dir : Path | None
@@ -133,23 +160,49 @@ class NestedLadder:
         self,
         calibrator: BatesSMM | None = None,
         kappa_grid: list[float] | None = None,
+        kappa_init: float = 5.0,
         rho: float = 0.0,
         figures_dir: Path | None = None,
     ):
         self.calibrator = calibrator or BatesSMM()
         self.kappa_grid = kappa_grid or [1.0, 5.0, 10.0]
+        self.kappa_init = kappa_init
         self.rho = rho
         self.figures_dir = (
             figures_dir or (config.DATA_DIR / "processed" / "figures")
         )
         self.figures_dir.mkdir(parents=True, exist_ok=True)
 
+    def run_selection(
+        self,
+        panel: pd.DataFrame,
+        verbose: bool = True,
+    ) -> LadderResult:
+        """§4.4 MAIN selection run — κ free and shared across the ladder.
+
+        This is the fit the selection tests are read from.  The fixed-κ
+        grid lives in run() and is §4.8 robustness only.
+        """
+        cache = self.calibrator.prepare(panel)
+
+        if verbose:
+            print(f"\n=== §4.4 Nested Ladder — selection run (κ free) ===")
+            print(f"  n_real={cache['n_real']}, n_sim={cache['n_sim']}, "
+                  f"θ={cache['theta']:.4f}, λ={cache['lambda_']:.4f}")
+
+        lr = self._fit_ladder(
+            cache, kappa=self.kappa_init, free_kappa=True, verbose=verbose
+        )
+        self._print_selection_summary(lr)
+        self._save_results_csv([lr], filename="smm_ladder_results_main.csv")
+        return lr
+
     def run(
         self,
         panel: pd.DataFrame,
         verbose: bool = True,
     ) -> list[LadderResult]:
-        """Run the full nested ladder for all κ values.
+        """§4.8 robustness: re-run the ladder with κ fixed at each grid value.
 
         Parameters
         ----------
@@ -166,7 +219,7 @@ class NestedLadder:
         cache = self.calibrator.prepare(panel)
 
         if verbose:
-            print(f"\n=== §4.4 Nested Ladder ===")
+            print(f"\n=== §4.8 Nested Ladder — fixed-κ robustness grid ===")
             print(f"  n_real={cache['n_real']}, n_sim={cache['n_sim']}, "
                   f"θ={cache['theta']:.4f}, λ={cache['lambda_']:.4f}")
 
@@ -174,25 +227,27 @@ class NestedLadder:
         for kappa in self.kappa_grid:
             if verbose:
                 print(f"\n--- κ = {kappa} ---")
-            lr = self._fit_one_kappa(cache, kappa, verbose=verbose)
+            lr = self._fit_ladder(cache, kappa, free_kappa=False,
+                                  verbose=verbose)
             results.append(lr)
 
         self._print_robustness_table(results)
         self._save_results_csv(results)
         return results
 
-    def run_fomc_cpi_split(
+    def run_family_split(
         self,
         panel: pd.DataFrame,
-        kappa: float = 5.0,
         verbose: bool = True,
     ) -> dict[str, LadderResult]:
-        """§4.8 robustness: run ladder separately per contract family.
+        """§4.8 robustness: run the (κ-free) ladder separately per contract
+        family.
 
-        Kalshi tickers split by prefix (KXFED / KXCPI).  Polymarket condition
-        IDs (0x…) are classified via the identity mapping in
-        data/exports/polymarket_contract_identities.csv (fed vs election),
-        since Polymarket carries no CPI markets.
+        Kalshi tickers split by prefix (KXFED / KXCPI).  Polymarket
+        condition IDs (0x…) are classified via the identity mapping in
+        data/exports/polymarket_contract_identities.csv.  Election markets
+        were cut from the corpus (July 2026); with a single remaining
+        family this reduces to the main run and is skipped upstream.
         """
         out: dict[str, LadderResult] = {}
         ids = panel["contract_id"].astype(str)
@@ -200,9 +255,9 @@ class NestedLadder:
         if ids.str.startswith("0x").all():
             id_path = Path("data/exports/polymarket_contract_identities.csv")
             groups = pd.read_csv(id_path).set_index("conditionId")["group"]
+            present = sorted(ids.map(groups).dropna().unique())
             splits = [
-                ("Fed", ids.map(groups).eq("fed")),
-                ("Election", ids.map(groups).eq("election")),
+                (g.capitalize(), ids.map(groups).eq(g)) for g in present
             ]
         else:
             splits = [
@@ -218,14 +273,15 @@ class NestedLadder:
             if verbose:
                 print(f"\n--- {series} sub-panel ({len(sub)} rows) ---")
             cache = self.calibrator.prepare(sub)
-            lr = self._fit_one_kappa(cache, kappa, verbose=verbose)
+            lr = self._fit_ladder(cache, kappa=self.kappa_init,
+                                  free_kappa=True, verbose=verbose)
             out[series] = lr
 
         rows = []
         for series, lr in out.items():
             for res in [lr.constant_vol, lr.heston, lr.bates, lr.merton]:
                 rows.append({
-                    "family": series, "kappa": lr.kappa, "model": res.model,
+                    "family": series, "kappa": res.kappa, "model": res.model,
                     "sigma_v": res.sigma_v, "sigma_J": res.sigma_J,
                     "j_stat": res.j_stat, "j_dof": res.j_dof,
                     "j_pvalue": res.j_pvalue, "n_real": res.n_real,
@@ -268,31 +324,55 @@ class NestedLadder:
     # Internal
     # ------------------------------------------------------------------
 
-    def _fit_one_kappa(
-        self, cache: dict, kappa: float, verbose: bool
+    def _fit_ladder(
+        self, cache: dict, kappa: float, free_kappa: bool, verbose: bool
     ) -> LadderResult:
         rho = self.rho
         cal = self.calibrator
 
-        cv  = cal.fit_constant_vol(cache, kappa=kappa, verbose=verbose)
-        hes = cal.fit_heston(cache, kappa=kappa, rho=rho, verbose=verbose)
-        bat = cal.fit_bates(cache, kappa=kappa, rho=rho, verbose=verbose)
-        mer = cal.fit_merton(cache, kappa=kappa, rho=rho, verbose=verbose)
+        cv = cal.fit_constant_vol(cache, kappa=kappa, rho=rho,
+                                  verbose=verbose)
+
+        # Warm-start each model at the optimum of the model it nests, so the
+        # richer model cannot end at a worse objective — worst case it stays
+        # at the warm start.  Vectors are ordered to match each fit's `free`
+        # tuple.
+        hes_warm = np.array([0.0, kappa]) if free_kappa else np.array([0.0])
+        hes = cal.fit_heston(cache, kappa=kappa, rho=rho,
+                             free_kappa=free_kappa, warm_starts=[hes_warm],
+                             verbose=verbose)
+
+        mer = cal.fit_merton(cache, kappa=kappa, rho=rho,
+                             warm_starts=[np.array([0.0])], verbose=verbose)
+
+        # Bates nests both Heston (σ_J=0) and Merton (σ_v=0) — start at both.
+        # κ is inert at σ_v=0, so Heston's κ̂ serves for the Merton start too.
+        kap_b = hes.kappa if free_kappa else kappa
+        bat_warms = [
+            np.array([hes.sigma_v, 0.0] + ([kap_b] if free_kappa else [])),
+            np.array([0.0, mer.sigma_J] + ([kap_b] if free_kappa else [])),
+        ]
+        bat = cal.fit_bates(cache, kappa=kap_b, rho=rho,
+                            free_kappa=free_kappa, warm_starts=bat_warms,
+                            verbose=verbose)
 
         # Standard errors for free-parameter models
-        se_sv_h, _      = cal.standard_errors(hes, cache)
-        se_sv_b, se_sJ_b= cal.standard_errors(bat, cache)
-        _,  se_sJ_m     = cal.standard_errors(mer, cache)
+        se_sv_h, _, se_k_h       = cal.standard_errors(hes, cache)
+        se_sv_b, se_sJ_b, se_k_b = cal.standard_errors(bat, cache)
+        _, se_sJ_m, _            = cal.standard_errors(mer, cache)
         hes.se_sigma_v  = se_sv_h
+        hes.se_kappa    = se_k_h
         bat.se_sigma_v  = se_sv_b
         bat.se_sigma_J  = se_sJ_b
+        bat.se_kappa    = se_k_b
         mer.se_sigma_J  = se_sJ_m
 
         test_sv    = diff_j_test(cv, hes)   # need stochastic vol?
         test_jumps = diff_j_test(hes, bat)  # need jumps?
 
         if verbose:
-            print(f"\n  Difference-in-J tests (κ={kappa}):")
+            tag = "κ free" if free_kappa else f"κ={kappa}"
+            print(f"\n  Difference-in-J tests ({tag}):")
             print(test_sv)
             print(test_jumps)
 
@@ -306,7 +386,21 @@ class NestedLadder:
             constant_vol=cv, heston=hes, bates=bat, merton=mer,
             test_sv=test_sv, test_jumps=test_jumps,
             moment_table=mtable,
+            free_kappa=free_kappa,
         )
+
+    @staticmethod
+    def _print_selection_summary(lr: LadderResult) -> None:
+        print("\n=== §4.4 Selection run summary (κ free) ===")
+        print(f"  {'Model':<12} {'σ_v':>9} {'σ_J':>9} {'κ̂':>9} "
+              f"{'J':>12} {'dof':>4} {'p':>7}")
+        for res in [lr.constant_vol, lr.heston, lr.merton, lr.bates]:
+            kap = f"{res.kappa:>9.4f}" if res.kappa_free else f"{'—':>9}"
+            print(f"  {res.model:<12} {res.sigma_v:>9.4f} {res.sigma_J:>9.4f} "
+                  f"{kap} {res.j_stat:>12.3f} {res.j_dof:>4d} "
+                  f"{res.j_pvalue:>7.3f}")
+        print(lr.test_sv)
+        print(lr.test_jumps)
 
     @staticmethod
     def _moment_table(*results: SMMResult) -> pd.DataFrame:
@@ -450,12 +544,18 @@ class NestedLadder:
             )
             print(row)
 
-    def _save_results_csv(self, results: list[LadderResult]) -> None:
+    def _save_results_csv(
+        self,
+        results: list[LadderResult],
+        filename: str = "smm_ladder_results.csv",
+    ) -> None:
         rows = []
         for lr in results:
             for res in [lr.constant_vol, lr.heston, lr.bates, lr.merton]:
                 rows.append({
-                    "kappa": lr.kappa,
+                    "kappa": res.kappa,
+                    "kappa_free": res.kappa_free,
+                    "se_kappa": res.se_kappa,
                     "model": res.model,
                     "sigma_v": res.sigma_v,
                     "se_sigma_v": res.se_sigma_v,
@@ -471,7 +571,7 @@ class NestedLadder:
                     "objective": res.objective_value,
                 })
         df = pd.DataFrame(rows)
-        out = config.DATA_DIR / "processed" / "smm_ladder_results.csv"
+        out = config.DATA_DIR / "processed" / filename
         df.to_csv(out, index=False, float_format="%.6f")
         print(f"\nLadder results saved: {out}")
 
@@ -648,11 +748,12 @@ def truncation_sensitivity(
         panel = panel.dropna(subset=["delta_X"]).reset_index(drop=True)
 
         cache = calibrator.prepare(panel)
-        res   = calibrator.fit_bates(cache, kappa=kappa, verbose=True)
+        res   = calibrator.fit_bates(cache, kappa=kappa, free_kappa=True,
+                                     verbose=True)
 
         rows.append({
             "clip": label, "clip_lo": clip_lo, "clip_hi": clip_hi,
-            "sigma_v": res.sigma_v, "sigma_J": res.sigma_J,
+            "sigma_v": res.sigma_v, "sigma_J": res.sigma_J, "kappa": res.kappa,
             "theta": res.theta, "lambda": res.lambda_,
             "j_stat": res.j_stat, "j_pvalue": res.j_pvalue,
             "n_real": res.n_real,
@@ -698,11 +799,12 @@ def frequency_sensitivity(
             continue
         panel = builder.build(tickers=tickers, force=True)
         cache = calibrator.prepare(panel)
-        res   = calibrator.fit_bates(cache, kappa=kappa, verbose=True)
+        res   = calibrator.fit_bates(cache, kappa=kappa, free_kappa=True,
+                                     verbose=True)
         rows.append({
             "freq": freq, "n_contracts": panel["contract_id"].nunique(),
             "n_real": res.n_real,
-            "sigma_v": res.sigma_v, "sigma_J": res.sigma_J,
+            "sigma_v": res.sigma_v, "sigma_J": res.sigma_J, "kappa": res.kappa,
             "j_stat": res.j_stat, "j_pvalue": res.j_pvalue,
         })
 
@@ -756,7 +858,8 @@ def bucketing_analysis(
 
         print(f"\n--- Bucket {bucket_label} ({n_c} contracts) ---")
         cache = calibrator.prepare(sub)
-        res   = calibrator.fit_bates(cache, kappa=kappa, verbose=True)
+        res   = calibrator.fit_bates(cache, kappa=kappa, free_kappa=True,
+                                     verbose=True)
 
         avg_len = float(lengths.loc[
             lengths["contract_id"].isin(bucket_tickers), "n_increments"
@@ -764,7 +867,7 @@ def bucketing_analysis(
         rows.append({
             "bucket": str(bucket_label), "n_contracts": n_c,
             "avg_increments": avg_len,
-            "sigma_v": res.sigma_v, "sigma_J": res.sigma_J,
+            "sigma_v": res.sigma_v, "sigma_J": res.sigma_J, "kappa": res.kappa,
             "j_stat": res.j_stat, "j_pvalue": res.j_pvalue,
         })
 
