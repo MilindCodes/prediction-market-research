@@ -56,7 +56,7 @@ import config
 from src.smm.bates_smm import (
     BatesSMM, SMMResult, _j_test, compute_moments, MOMENT_LABELS, N_MOMENTS
 )
-from src.smm.stylized_facts import StylizedFacts
+from src.smm.stylized_facts import StylizedFacts, _decompose_panel
 
 
 # ---------------------------------------------------------------------------
@@ -177,11 +177,17 @@ class NestedLadder:
         self,
         panel: pd.DataFrame,
         verbose: bool = True,
+        save_as: "str | None" = "smm_ladder_results_main.csv",
+        moment_table_as: "str | None" = "smm_moment_table_main.csv",
     ) -> LadderResult:
         """§4.4 MAIN selection run — κ free and shared across the ladder.
 
         This is the fit the selection tests are read from.  The fixed-κ
         grid lives in run() and is §4.8 robustness only.
+
+        save_as / moment_table_as may be None so that callers running the
+        ladder repeatedly (e.g. the §4.8 sampling sweep) do not overwrite
+        the headline §4.4 artifacts.
         """
         cache = self.calibrator.prepare(panel)
 
@@ -194,7 +200,10 @@ class NestedLadder:
             cache, kappa=self.kappa_init, free_kappa=True, verbose=verbose
         )
         self._print_selection_summary(lr)
-        self._save_results_csv([lr], filename="smm_ladder_results_main.csv")
+        if save_as:
+            self._save_results_csv([lr], filename=save_as)
+        if moment_table_as:
+            self._save_moment_table(lr, filename=moment_table_as)
         return lr
 
     def run(
@@ -324,8 +333,31 @@ class NestedLadder:
     # Internal
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _project(model: str, free_kappa: bool,
+                 sv: float, sJ: float, kap: float) -> np.ndarray:
+        """Project a candidate point onto one model's free-parameter space.
+
+        Ordering matches each fit's `free` tuple:
+          Heston ("sigma_v"[, "kappa"]) — drops σ_J
+          Merton ("sigma_J",)           — drops σ_v and κ (both inert)
+          Bates  ("sigma_v", "sigma_J"[, "kappa"])
+        """
+        if model == "Heston":
+            return np.array([sv] + ([kap] if free_kappa else []))
+        if model == "Merton":
+            return np.array([sJ])
+        if model == "Bates":
+            return np.array([sv, sJ] + ([kap] if free_kappa else []))
+        raise ValueError(model)
+
     def _fit_ladder(
-        self, cache: dict, kappa: float, free_kappa: bool, verbose: bool
+        self,
+        cache: dict,
+        kappa: float,
+        free_kappa: bool,
+        verbose: bool,
+        max_passes: int = 3,
     ) -> LadderResult:
         rho = self.rho
         cal = self.calibrator
@@ -355,6 +387,75 @@ class NestedLadder:
         bat = cal.fit_bates(cache, kappa=kap_b, rho=rho,
                             free_kappa=free_kappa, warm_starts=bat_warms,
                             verbose=verbose)
+
+        # ------------------------------------------------------------------
+        # Cross-warm-start polish.
+        #
+        # Warm-starting only downward (rich model at the restricted model's
+        # optimum) guarantees J_restricted >= J_full, but it does NOT
+        # guarantee that the RESTRICTED model reached its own optimum.  That
+        # gap is not cosmetic: if Bates lands on a point with sigma_J = 0
+        # that Heston's own search missed, the difference-in-J test credits
+        # the whole improvement to the jump parameter when the jump
+        # parameter is doing nothing.  Observed in practice on the
+        # revision-time panel — Heston obj 117.12 against a Heston-FEASIBLE
+        # Bates point at 73.16, reported as "jumps selected" with
+        # sigma_J = 0.
+        #
+        # So: re-fit every model from the projection of every other model's
+        # optimum onto its own parameter space, and repeat until nothing
+        # improves.  Each re-fit can only lower the objective (its previous
+        # optimum is always among the starts), so this terminates and never
+        # degrades a fit.
+        # ------------------------------------------------------------------
+        for _ in range(max_passes - 1):
+            improved = False
+
+            for name in ("Heston", "Merton", "Bates"):
+                current = {"Heston": hes, "Merton": mer, "Bates": bat}[name]
+                # Recomputed per model, not per pass: Bates is polished last
+                # and must see the improvement Heston just made in this same
+                # pass.  Otherwise a pass can end with the restricted model
+                # strictly better than the model that nests it, which
+                # diff_j_test (correctly) refuses to interpret.
+                candidates = [(r.sigma_v, r.sigma_J, r.kappa)
+                              for r in (hes, mer, bat)]
+                fk = free_kappa and name != "Merton"
+                warms = [
+                    self._project(name, fk, current.sigma_v,
+                                  current.sigma_J, current.kappa)
+                ] + [
+                    self._project(name, fk, sv, sJ, k)
+                    for (sv, sJ, k) in candidates
+                ]
+                kap_use = current.kappa if fk else kappa
+                fit_fn = {"Heston": cal.fit_heston,
+                          "Merton": cal.fit_merton,
+                          "Bates":  cal.fit_bates}[name]
+                kwargs = dict(kappa=kap_use, rho=rho,
+                              warm_starts=warms, verbose=False)
+                if name != "Merton":
+                    kwargs["free_kappa"] = fk
+                cand = fit_fn(cache, **kwargs)
+
+                tol = 1e-9 * max(1.0, abs(current.objective_value))
+                if cand.objective_value < current.objective_value - tol:
+                    if verbose:
+                        print(f"  [polish] {name}: obj "
+                              f"{current.objective_value:.6f} → "
+                              f"{cand.objective_value:.6f}  "
+                              f"(σ_v={cand.sigma_v:.4f}, σ_J={cand.sigma_J:.4f}"
+                              + (f", κ={cand.kappa:.4f})" if fk else ")"))
+                    improved = True
+                    if name == "Heston":
+                        hes = cand
+                    elif name == "Merton":
+                        mer = cand
+                    else:
+                        bat = cand
+
+            if not improved:
+                break
 
         # Standard errors for free-parameter models
         se_sv_h, _, se_k_h       = cal.standard_errors(hes, cache)
@@ -490,7 +591,11 @@ class NestedLadder:
 
         fig, axes = plt.subplots(1, 2, figsize=(11, 4))
 
-        # Aggregational Gaussianity overlay
+        # Aggregational Gaussianity overlay — the informative panel.  The
+        # empirical curve decays toward 0 (§4.2, diagnostic 3); a fitted
+        # jump component predicts kurtosis that PERSISTS under aggregation.
+        # Any visible gap here is evidence about the jump selection, not a
+        # cosmetic defect: see §4.6.
         ax = axes[0]
         ks_r = sorted(kag_real.keys())
         ks_s = sorted(kag_sim.keys())
@@ -503,18 +608,35 @@ class NestedLadder:
         ax.set_ylabel("Excess kurtosis")
         ax.legend()
 
-        # Boundary scaling: empirical slope
-        from src.smm.stylized_facts import _predetermined_p
+        # Boundary scaling: empirical vs simulated slope.  The empirical
+        # slope has to be COMPUTED from the real panel — it was previously
+        # hard-coded to 0.0, which drew a comparison that was not one.
+        from src.smm.stylized_facts import StylizedFacts as _SF, _predetermined_p
         p_pre = _predetermined_p(panel)
-        bs_real = sim_facts["boundary_scaling"]
+        bs_real = _SF()._boundary_scaling(inc_real, p_pre)
+        bs_sim  = sim_facts["boundary_scaling"]
         ax2 = axes[1]
         ax2.bar(
-            ["Empirical slope", f"{result.model} slope"],
-            [0.0, bs_real["slope"]],
+            ["Empirical", f"Simulated ({result.model})"],
+            [bs_real["slope"], bs_sim["slope"]],
             color=["steelblue", "salmon"],
         )
-        ax2.set_title("§4.7 Boundary scaling slope (simulated)")
-        ax2.set_ylabel("OLS slope on p(1-p)")
+        ax2.axhline(0, color="black", linewidth=0.7)
+        ax2.set_title("§4.7 Boundary scaling slope")
+        ax2.set_ylabel("OLS slope on p(1−p)")
+        for i, v in enumerate([bs_real["slope"], bs_sim["slope"]]):
+            ax2.text(i, v, f"{v:.3f}", ha="center",
+                     va="bottom" if v >= 0 else "top", fontsize=9)
+
+        # The simulated panel is reconstructed by forward-integrating ΔX and
+        # re-clipping, so the boundary and clustering curves are partly
+        # circular; the aggregational panel is the one that carries evidence.
+        print(f"  Boundary slope — empirical {bs_real['slope']:.4f} "
+              f"vs simulated {bs_sim['slope']:.4f}")
+        print("  Aggregational kurtosis (k: empirical / simulated):")
+        for k in ks_r:
+            if k in kag_sim:
+                print(f"    k={k:<3d} {kag_real[k]:>8.2f} / {kag_sim[k]:>8.2f}")
 
         plt.tight_layout()
         out = self.figures_dir / f"validation_{result.model}.png"
@@ -543,6 +665,35 @@ class NestedLadder:
                 f"  {lr.test_jumps.p_value:>6.3f}"
             )
             print(row)
+
+    @staticmethod
+    def _save_moment_table(
+        lr: LadderResult,
+        filename: str = "smm_moment_table_main.csv",
+    ) -> pd.DataFrame:
+        """§4.5/§4.6 — export the five real moments beside the five simulated
+        moments at each model's optimum.
+
+        This is the exhibit §4.6 argues from: a reader can see directly which
+        moments Heston misses and Bates hits, instead of taking it on trust.
+        One row per moment; Target plus one column per model, with the signed
+        relative miss alongside.
+        """
+        models = [lr.constant_vol, lr.heston, lr.merton, lr.bates]
+        target = models[0].moments_real
+        denom = np.maximum(np.abs(target), 1e-10)
+
+        data: dict = {"Moment": list(MOMENT_LABELS), "Target": list(target)}
+        for m in models:
+            data[m.model] = list(m.moments_sim)
+        for m in models:
+            data[f"relmiss_{m.model}"] = list((m.moments_sim - target) / denom)
+
+        df = pd.DataFrame(data)
+        out = config.DATA_DIR / "processed" / filename
+        df.to_csv(out, index=False, float_format="%.6f")
+        print(f"Moment table (target vs achieved) saved: {out}")
+        return df
 
     def _save_results_csv(
         self,
@@ -654,31 +805,39 @@ def moment_selection_analysis(
 
         print(f"  {moment:<28s}  {status}  {tag}")
 
-    # Heatmap of relative misses
+    # Heatmap of relative misses.
+    #
+    # Colour encodes the ABSOLUTE miss, not the signed one.  With a signed
+    # scale on RdYlGn_r a perfect fit (0.00) renders yellow while a total
+    # miss of -1.00 renders dark green — i.e. the worst cell in the figure
+    # looked like the best one, inverting the caption.  Magnitude drives
+    # the colour; the signed value stays in the annotation so the direction
+    # of each miss is still readable.
     try:
         import matplotlib.pyplot as plt
-        import matplotlib.colors as mcolors
 
         miss_cols = [f"miss_{m.model}" for m in models]
         miss_data = df[miss_cols].values
         model_labels = [m.model for m in models]
 
         fig, ax = plt.subplots(figsize=(9, 4))
-        cmap = plt.cm.RdYlGn_r
-        im = ax.imshow(miss_data.T, aspect="auto", cmap=cmap, vmin=-1, vmax=1)
+        im = ax.imshow(np.abs(miss_data.T), aspect="auto",
+                       cmap=plt.cm.RdYlGn_r, vmin=0.0, vmax=1.0)
         ax.set_xticks(range(N_MOMENTS))
         ax.set_xticklabels(MOMENT_LABELS, rotation=25, ha="right", fontsize=8)
         ax.set_yticks(range(len(model_labels)))
         ax.set_yticklabels(model_labels)
-        plt.colorbar(im, ax=ax, label="Relative miss (achieved−target)/|target|")
-        ax.set_title("§4.6 Moment fit by model  (green=good, red=misses)")
+        plt.colorbar(im, ax=ax,
+                     label="|relative miss|  (0 = on target, 1 = 100% off)")
+        ax.set_title("§4.6 Moment fit by model  "
+                     "(green = on target, red = misses; cells show signed miss)")
 
-        # Annotate with numbers
         for i in range(N_MOMENTS):
             for j, m in enumerate(models):
                 val = miss_data[i, j]
                 ax.text(i, j, f"{val:+.2f}", ha="center", va="center",
-                        fontsize=7, color="white" if abs(val) > 0.5 else "black")
+                        fontsize=7,
+                        color="white" if abs(val) > 0.6 else "black")
 
         plt.tight_layout()
         out = Path(figures_dir) / "moment_selection.png"
@@ -687,6 +846,12 @@ def moment_selection_analysis(
         print(f"\n  Figure: {out}")
     except Exception as e:
         print(f"  (Figure skipped: {e})")
+
+    # The figure and the table must come from the same fit — export the
+    # numbers behind the heatmap so §4.6 can cite them directly.
+    out_csv = config.DATA_DIR / "processed" / "smm_moment_selection.csv"
+    df.to_csv(out_csv, index=False, float_format="%.6f")
+    print(f"  Table:  {out_csv}")
 
     return df
 
@@ -775,13 +940,16 @@ def frequency_sensitivity(
     kappa: float = 5.0,
     freqs: "list[str] | None" = None,
 ) -> pd.DataFrame:
-    """§4.8 — Re-run panel and SMM at alternative grid frequencies.
+    """§4.8 — Re-run panel and Bates SMM at alternative grid frequencies.
 
     Compares the daily (D) baseline against coarser grids (2D, 4D).
     Coarser grids have fewer forward-filled zero-increments but also
     less data — the sensitivity checks that results are stable.
     (The raw bars are daily, so grids finer than 1D would only add
     forward-filled artifacts.)
+
+    This fits Bates only.  For the full ladder — and hence the selection
+    verdicts — use sampling_sensitivity() below.
     """
     from src.smm.panel import SMMPanelBuilder
 
@@ -792,6 +960,8 @@ def frequency_sensitivity(
     rows = []
     for freq in freqs:
         print(f"\n--- Frequency sensitivity: {freq} ---")
+        # Each (freq, sampling) writes to its own cache path, so this no
+        # longer overwrites the baseline daily panel the §4.4 run reads.
         builder = SMMPanelBuilder(freq=freq)
         tickers = builder._load_catalog_tickers()
         if not tickers:
@@ -816,6 +986,197 @@ def frequency_sensitivity(
         df.to_csv(out, index=False, float_format="%.6f")
         print(f"Saved: {out}")
     return df
+
+
+# ---------------------------------------------------------------------------
+# §4.8  Sampling-scheme sweep: the zero-increment test
+# ---------------------------------------------------------------------------
+
+SAMPLING_SPECS: list[tuple[str, str]] = [
+    ("D",  "calendar"),   # baseline — the §4.4 panel
+    ("2D", "calendar"),
+    ("3D", "calendar"),
+    ("4D", "calendar"),
+    ("D",  "revision"),   # event time — zero-increment mass is 0 by construction
+]
+
+
+def _panel_descriptives(panel: pd.DataFrame) -> dict:
+    """Zero mass, tail shape, and aggregational decay for one panel."""
+    dx_raw = panel["delta_X"].dropna().values
+    inc = _decompose_panel(panel)
+
+    kurt_by_k: dict[int, float] = {}
+    for k in (1, 2, 4, 8):
+        pooled = []
+        for dx in inc.values():
+            nb = len(dx) // k
+            if nb < 2:
+                continue
+            blocks = dx[: nb * k].reshape(nb, k).sum(axis=1)
+            sd = blocks.std(ddof=1)
+            if sd > 0:
+                pooled.append((blocks - blocks.mean()) / sd)
+        if pooled:
+            kurt_by_k[k] = float(stats.kurtosis(np.concatenate(pooled),
+                                                fisher=True))
+
+    dt = panel["dt_steps"].dropna() if "dt_steps" in panel.columns else None
+    return {
+        "n_contracts": int(panel["contract_id"].nunique()),
+        "n_increments": int(len(dx_raw)),
+        "zero_frac": float(np.mean(dx_raw == 0.0)),
+        "kurt_k1": kurt_by_k.get(1, np.nan),
+        "kurt_k2": kurt_by_k.get(2, np.nan),
+        "kurt_k4": kurt_by_k.get(4, np.nan),
+        "kurt_k8": kurt_by_k.get(8, np.nan),
+        "mean_dt_steps": float(dt.mean()) if dt is not None and len(dt) else 1.0,
+        "p95_dt_steps": float(dt.quantile(0.95)) if dt is not None and len(dt) else 1.0,
+    }
+
+
+def sampling_sensitivity(
+    calibrator: "BatesSMM | None" = None,
+    kappa_init: float = 5.0,
+    specs: "list[tuple[str, str]] | None" = None,
+    verbose: bool = True,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """§4.8 — Re-run the FULL nested ladder under each sampling scheme.
+
+    Why this run exists
+    -------------------
+    The §4.4 panel is 36.6% exact zeros: the CLOB prices-history endpoint
+    returns one daily bar per contract-day and stale days are forward-filled,
+    so a third of the "increments" are not revisions.  A zero-inflated
+    increment distribution deflates the variance moment and inflates
+    kurtosis, which is exactly the signature the ladder reads as jumps.  So
+    the §4.4 jump verdict and the §4.2 diagnostic-3 finding (kurtosis DECAYS
+    under aggregation, i.e. no persistent jump component) may be in conflict
+    for a purely mechanical reason.
+
+    This is the test that resolves it.  Two ways to shrink the zero mass:
+
+      * coarsen the calendar grid (2D/3D/4D) — keeps Δt constant, but
+        drains the sample and only partly removes the zeros;
+      * sample in revision (event) time — collapse repeated log-odds so
+        every increment is a genuine revision.  Zero mass is 0 by
+        construction and most of the sample survives, at the cost of a
+        non-constant Δt (quantified by dt_steps).
+
+    True trade-time sampling is not available: the pulled bars carry
+    volume ≡ 0 and trade_count ≡ 0, so the archive has no trade clock.
+    Revision time is the closest feasible approximation and is labelled as
+    such rather than called trade time.
+
+    Reading the output
+    ------------------
+    J levels are NOT comparable across rows — each panel gets its own
+    bootstrap W, θ and λ.  What IS comparable is the selection verdict:
+    the difference-in-J p-values for "need stochastic vol?" and "need
+    jumps?".  If jumps stop being selected once the zeros are removed, the
+    §4.4 finding was an artifact of the forward fill.
+
+    Returns
+    -------
+    (summary, full) — one row per spec; one row per (spec, model).
+    """
+    from src.smm.panel import SMMPanelBuilder
+
+    calibrator = calibrator or BatesSMM()
+    specs = specs or SAMPLING_SPECS
+
+    summary_rows: list[dict] = []
+    full_rows: list[dict] = []
+
+    for freq, sampling in specs:
+        label = f"{freq}/{sampling}"
+        print(f"\n{'='*66}\n--- Sampling sensitivity: {label} ---\n{'='*66}")
+
+        builder = SMMPanelBuilder(freq=freq, sampling=sampling)
+        tickers = builder._load_catalog_tickers()
+        if not tickers:
+            print("  No tickers — run the catalog step first.")
+            continue
+        panel = builder.build(tickers=tickers, force=True)
+
+        desc = _panel_descriptives(panel)
+        print(f"  {desc['n_contracts']} contracts, {desc['n_increments']} "
+              f"increments, zero mass {desc['zero_frac']:.1%}, "
+              f"kurt(k=1)={desc['kurt_k1']:.1f} → kurt(k=8)={desc['kurt_k8']:.1f}")
+
+        ladder = NestedLadder(calibrator=calibrator, kappa_init=kappa_init)
+        # save_as=None: these are robustness fits and must not overwrite the
+        # headline §4.4 artifacts.
+        lr = ladder.run_selection(panel, verbose=verbose,
+                                  save_as=None, moment_table_as=None)
+
+        row = {"freq": freq, "sampling": sampling, "spec": label}
+        row.update(desc)
+        row.update({
+            "theta":          lr.bates.theta,
+            "lambda":         lr.bates.lambda_,
+            "sigma_v_heston": lr.heston.sigma_v,
+            "sigma_v_bates":  lr.bates.sigma_v,
+            "sigma_J_bates":  lr.bates.sigma_J,
+            "sigma_J_merton": lr.merton.sigma_J,
+            "kappa_bates":    lr.bates.kappa,
+            "j_cv":           lr.constant_vol.j_stat,
+            "j_heston":       lr.heston.j_stat,
+            "j_merton":       lr.merton.j_stat,
+            "j_bates":        lr.bates.j_stat,
+            "diffj_sv":       lr.test_sv.diff_j,
+            "p_sv":           lr.test_sv.p_value,
+            "sv_selected":    lr.test_sv.reject_at_05,
+            "diffj_jumps":    lr.test_jumps.diff_j,
+            "p_jumps":        lr.test_jumps.p_value,
+            "jumps_selected": lr.test_jumps.reject_at_05,
+        })
+        summary_rows.append(row)
+
+        for res in (lr.constant_vol, lr.heston, lr.merton, lr.bates):
+            full_rows.append({
+                "spec": label, "freq": freq, "sampling": sampling,
+                "model": res.model,
+                "sigma_v": res.sigma_v, "se_sigma_v": res.se_sigma_v,
+                "sigma_J": res.sigma_J, "se_sigma_J": res.se_sigma_J,
+                "kappa": res.kappa, "se_kappa": res.se_kappa,
+                "theta": res.theta, "lambda": res.lambda_,
+                "j_stat": res.j_stat, "j_dof": res.j_dof,
+                "j_pvalue": res.j_pvalue,
+                "n_real": res.n_real, "n_sim": res.n_sim,
+                "objective": res.objective_value,
+            })
+
+    summary = pd.DataFrame(summary_rows)
+    full    = pd.DataFrame(full_rows)
+
+    if not summary.empty:
+        print(f"\n\n{'='*90}")
+        print("=== §4.8 Sampling-scheme sweep — full ladder under each scheme ===")
+        print(f"{'='*90}")
+        print(f"{'spec':<14}{'n_c':>5}{'n_inc':>7}{'zero%':>8}"
+              f"{'kurt k1':>9}{'kurt k8':>9}"
+              f"{'sig_v(B)':>10}{'sig_J(B)':>10}"
+              f"{'p(SV)':>8}{'p(jump)':>9}  verdict")
+        for r in summary.itertuples():
+            verdict = ("jumps selected" if r.jumps_selected
+                       else "JUMPS NOT SELECTED")
+            print(f"{r.spec:<14}{r.n_contracts:>5}{r.n_increments:>7}"
+                  f"{r.zero_frac*100:>7.1f}%"
+                  f"{r.kurt_k1:>9.1f}{r.kurt_k8:>9.1f}"
+                  f"{r.sigma_v_bates:>10.4f}{r.sigma_J_bates:>10.4f}"
+                  f"{r.p_sv:>8.3f}{r.p_jumps:>9.3f}  {verdict}")
+        print("\n  J levels are not comparable across rows (each panel has its")
+        print("  own bootstrap W, θ and λ); the selection verdicts are.")
+
+        out_s = config.DATA_DIR / "processed" / "smm_sampling_sensitivity.csv"
+        out_f = config.DATA_DIR / "processed" / "smm_sampling_ladder_full.csv"
+        summary.to_csv(out_s, index=False, float_format="%.6f")
+        full.to_csv(out_f, index=False, float_format="%.6f")
+        print(f"\nSaved: {out_s}")
+        print(f"Saved: {out_f}")
+
+    return summary, full
 
 
 def bucketing_analysis(

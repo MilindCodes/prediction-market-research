@@ -468,6 +468,8 @@ class BatesSMM:
         # it nests.
         x0_pool = (
             [np.asarray(w, dtype=float) for w in (warm_starts or [])]
+            + self._grid_starts(free, sd_real, kappa, theta, lambda_, rho,
+                                n_sim, randoms, m_real, W)
             + self._starting_points(free, sd_real)[: self.n_restarts]
         )
 
@@ -650,6 +652,53 @@ class BatesSMM:
             np.array([guesses[name][i] for name in free])
             for i in range(3)
         ]
+
+    # Coarse global grid used to seed Nelder-Mead.
+    #
+    # This objective has well-separated basins: the jump solution sits near
+    # (sigma_v ~ 0.05, kappa ~ 0.001) while the pure-vol solution sits near
+    # (sigma_v ~ 0.28, kappa ~ 0.27).  Nelder-Mead started from a handful of
+    # hand-picked points can converge into the wrong basin and report it as
+    # the optimum — which then feeds a difference-in-J test that reads the
+    # optimizer's failure as a model-selection verdict.  Seeding from the
+    # best few points of a coarse grid makes the search basin-agnostic.
+    GRID_SIGMA_V = (0.0, 0.05, 0.1, 0.15, 0.2, 0.28, 0.4, 0.6, 0.9)
+    GRID_SIGMA_J_MULT = (0.0, 0.3, 1.2, 2.5, 3.8, 4.7, 5.7)
+    GRID_KAPPA = (0.001, 0.01, 0.1, 0.3, 1.0, 5.0)
+
+    def _grid_starts(
+        self,
+        free: tuple[str, ...],
+        sd_real: float,
+        kappa: float,
+        theta: float,
+        lambda_: float,
+        rho: float,
+        n_sim: int,
+        randoms: dict,
+        m_real: np.ndarray,
+        W: np.ndarray,
+        n_keep: int = 3,
+    ) -> list[np.ndarray]:
+        """Evaluate a coarse grid and return the best `n_keep` points."""
+        axes = []
+        for name in free:
+            if name == "sigma_v":
+                axes.append(self.GRID_SIGMA_V)
+            elif name == "sigma_J":
+                axes.append(tuple(m * sd_real for m in self.GRID_SIGMA_J_MULT))
+            else:
+                axes.append(self.GRID_KAPPA)
+
+        import itertools
+        scored: list[tuple[float, np.ndarray]] = []
+        for combo in itertools.product(*axes):
+            x = np.array(combo, dtype=float)
+            val = self._objective(x, free, kappa, theta, lambda_, rho,
+                                  n_sim, randoms, m_real, W)
+            scored.append((val, x))
+        scored.sort(key=lambda t: t[0])
+        return [x for _, x in scored[:n_keep]]
 
 
 # ---------------------------------------------------------------------------

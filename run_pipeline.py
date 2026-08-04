@@ -7,6 +7,12 @@ Usage:
 
 Run 'python run_pipeline.py help' to see all available steps.
 """
+# Built-in generic annotations (list[dict], dict | None) are evaluated at
+# runtime before Python 3.9.  The other modules in this repo already defer
+# annotations this way; without it run_pipeline is the only file that cannot
+# be executed by the 3.8 interpreter holding the pandas/pyarrow install.
+from __future__ import annotations
+
 import sys
 import os
 

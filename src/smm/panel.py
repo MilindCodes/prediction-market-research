@@ -14,6 +14,25 @@ would forward-fill ~24 artificial zero-increments per real observation.
 If a contract's parquet is missing and a KalshiClient is provided,
 the builder falls back to a fresh pull that routes settled contracts to
 GET /historical/trades and open/recent ones to GET /markets/trades.
+
+Sampling schemes
+----------------
+"calendar" (default)
+    The fixed-Δt grid described above.  Every grid point yields an
+    increment, so stale bars enter as exact zeros.  Δt is constant, which
+    is what the §4.3 units convention assumes.
+
+"revision"
+    Event-time sampling: consecutive grid points carrying the *same*
+    log-odds are collapsed, so every retained increment is a genuine
+    price revision and the zero-increment mass is 0 by construction.
+    This is the closest feasible approximation to trade-time sampling —
+    the CLOB prices-history endpoint returns daily OHLC bars with no
+    volume or trade-count behind them (both fields are identically zero
+    in the pulled data), so true trade time is not recoverable from the
+    archive.  The cost is that Δt is no longer constant: the number of
+    base-grid steps each increment spans is recorded in `dt_steps` so
+    the §4.3 units caveat can be quantified rather than asserted.
 """
 from __future__ import annotations
 
@@ -44,13 +63,17 @@ class SMMPanelBuilder:
     p           : float — clipped YES probability in (0, 1)
     X           : float — log-odds = log(p / (1-p))
     delta_X     : float — within-contract first difference of X
+    dt_steps    : int   — base-grid steps spanned by this increment
+                          (always 1 under calendar sampling)
 
     Steps
     -----
     1. Load existing hourly-bar parquets (or pull fresh via API).
     2. Reindex to a complete hourly grid; forward-fill within contract life.
     3. Clip p to [CLIP_LO, CLIP_HI]; compute X and ΔX (never across boundary).
-    4. Concatenate and save to data/processed/smm_panel.parquet.
+    4. Under "revision" sampling, drop grid points that repeat the previous
+       log-odds, so every increment is a genuine revision.
+    5. Concatenate and save to data/processed/smm_panel*.parquet.
     """
 
     def __init__(
@@ -58,14 +81,38 @@ class SMMPanelBuilder:
         client=None,
         data_dir: Path | None = None,
         freq: str = GRID_FREQ,
+        sampling: str = "calendar",
     ):
+        if sampling not in ("calendar", "revision"):
+            raise ValueError(
+                f"sampling must be 'calendar' or 'revision', got {sampling!r}"
+            )
         self.client = client
         self.data_dir = data_dir or config.DATA_DIR
         self.raw_dir = self.data_dir / "raw" / "polymarket"
         self.processed_dir = self.data_dir / "processed"
         self.processed_dir.mkdir(parents=True, exist_ok=True)
         self.freq = freq
+        self.sampling = sampling
         self._hist_cutoff: pd.Timestamp | None = None
+
+    # ------------------------------------------------------------------
+    # Cache path
+    # ------------------------------------------------------------------
+
+    def panel_path(self) -> Path:
+        """Where this (freq, sampling) combination is cached.
+
+        The baseline daily calendar panel keeps the historic filename so
+        every existing caller and saved artifact still resolves.  Any other
+        combination gets its own file — previously the sensitivity runs
+        rebuilt with force=True and silently overwrote the baseline panel
+        that the §4.4 selection run reads from.
+        """
+        if self.freq == GRID_FREQ and self.sampling == "calendar":
+            return self.processed_dir / "smm_panel.parquet"
+        suffix = f"{self.freq.lower()}_{self.sampling}"
+        return self.processed_dir / f"smm_panel_{suffix}.parquet"
 
     # ------------------------------------------------------------------
     # Public entry point
@@ -92,7 +139,7 @@ class SMMPanelBuilder:
         -------
         pd.DataFrame with columns: contract_id, t, p, X, delta_X
         """
-        out_path = self.processed_dir / "smm_panel.parquet"
+        out_path = self.panel_path()
         if out_path.exists() and not force:
             print(f"  Loading existing SMM panel from {out_path}")
             panel = pd.read_parquet(out_path)
@@ -310,6 +357,27 @@ class SMMPanelBuilder:
         p = np.clip(p_raw, CLIP_LO, CLIP_HI)
         X = np.log(p / (1.0 - p))
 
+        # Event-time sampling: collapse runs of identical log-odds so that
+        # every surviving increment is a genuine revision.  Done AFTER the
+        # clip, deliberately: once a price is pinned outside [CLIP_LO,
+        # CLIP_HI] its further moves are not observable in X, so they are
+        # not revisions of the modelled quantity.
+        dt_steps = np.ones(len(X), dtype=float)
+        if self.sampling == "revision":
+            keep = np.ones(len(X), dtype=bool)
+            keep[1:] = X[1:] != X[:-1]
+            idx = np.flatnonzero(keep)
+            if len(idx) < 3:
+                return None
+            # Base-grid steps spanned by each retained increment; the first
+            # retained point anchors the series and has no increment.
+            dt_steps = np.empty(len(idx), dtype=float)
+            dt_steps[0] = np.nan
+            dt_steps[1:] = np.diff(idx)
+            p_raw, p, X = p_raw[idx], p[idx], X[idx]
+        else:
+            dt_steps[0] = np.nan
+
         # Within-contract differencing — never across contract boundary
         delta_X = np.empty(len(X))
         delta_X[0] = np.nan
@@ -317,10 +385,11 @@ class SMMPanelBuilder:
 
         out = pd.DataFrame({
             "contract_id": ticker,
-            "t": np.arange(len(bars)),
+            "t": np.arange(len(X)),
             "p_raw": p_raw,   # unclipped — kept so truncation sensitivity can re-clip
             "p": p,
             "X": X,
             "delta_X": delta_X,
+            "dt_steps": dt_steps,
         })
         return out.dropna(subset=["delta_X"]).reset_index(drop=True)
