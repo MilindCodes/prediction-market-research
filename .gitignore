@@ -1,32 +1,117 @@
+# ===========================================================================
+# SECRETS — nothing in this block may ever be committed.
+# If you add a new credential file, add it here FIRST, then create the file.
+# ===========================================================================
+researchproject1.txt
+researchproject2.txt
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+*credentials*.json
+secrets.*
+.env
+.env.*
+!.env.example
+.netrc
+
+# ===========================================================================
 # Python
+# ===========================================================================
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 *.egg-info/
+*.egg
 dist/
 build/
+sdist/
+wheels/
+pip-wheel-metadata/
+.Python
+
+# Virtual environments
 .venv/
-env/
 venv/
+env/
+ENV/
+.python-version
+.conda/
 
-# Mac
-.DS_Store
-.AppleDouble
-.LSOverride
+# Test / coverage / type-check caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.hypothesis/
 
+# ===========================================================================
 # Jupyter
+# ===========================================================================
 .ipynb_checkpoints/
+*/.ipynb_checkpoints/*
+profile_default/
+ipython_config.py
+
+# ===========================================================================
+# Editors / IDEs
+# ===========================================================================
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.spyderproject
+.spyproject
+.ropeproject
 
 # Claude Code local settings
 .claude/
 
-# Word/Office files (not git-friendly binary format)
+# ===========================================================================
+# OS artefacts
+# ===========================================================================
+.DS_Store
+.DS_Store?
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+.VolumeIcon.icns
+Icon?
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ===========================================================================
+# Logs and scratch output
+# ===========================================================================
+*.log
+logs/
+*.out
+*.tmp
+tmp/
+scratch/
+
+# ===========================================================================
+# Office documents (binary, not git-friendly — export to Markdown instead)
+# ===========================================================================
 *.docx
 *.doc
-
-# Secrets — API private keys must never be committed
-researchproject2.txt
-*.pem
-*.key
-researchproject1.txt
+*.xls
+~$*

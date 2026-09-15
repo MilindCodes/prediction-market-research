@@ -39,6 +39,7 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 
 import config
+from src.figstyle import apply_publication_style, save_figure
 
 
 # ---------------------------------------------------------------------------
@@ -75,14 +76,23 @@ def _decompose_panel(panel: pd.DataFrame) -> dict[str, np.ndarray]:
 
 
 def _predetermined_p(panel: pd.DataFrame) -> dict[str, np.ndarray]:
-    """Return dict cid → p[t-1] array (one shorter than delta_X)."""
+    """Return dict cid → p at the START of each increment (predetermined).
+
+    §4.2 diagnostic 4 regresses ΔX² on p(1−p) and requires p to be
+    predetermined: p[t] is a function of the same ΔX[t] being regressed, so
+    using it builds in mechanical endogeneity.
+
+    The panel arrives already differenced, with the leading row of each
+    contract dropped, so every ΔX is non-null and the old `~isnan(delta_X)`
+    filter selected everything — returning contemporaneous p[t] despite the
+    name.  Shifting by one row within contract gives the intended p[t−1] and
+    costs the first increment of each contract, which has no predecessor in
+    the saved panel.
+    """
     out: dict[str, np.ndarray] = {}
     for cid, grp in panel.groupby("contract_id", sort=False):
         grp = grp.sort_values("t")
-        p_vals = grp["p"].values
-        dx_vals = grp["delta_X"].values
-        valid = ~np.isnan(dx_vals)
-        p_pre = p_vals[valid]
+        p_pre = grp["p"].values[:-1]          # p at the start of ΔX[1:]
         if len(p_pre) >= 5:
             out[str(cid)] = p_pre
     return out
@@ -151,7 +161,12 @@ class StylizedFacts:
         }
         results["fat_tails"]       = self._fat_tails(pooled_std)
         results["vol_clustering"]  = self._vol_clustering(inc)
+        # Standardized: what §4.7's overlay and §4.8's sampling table quote.
         results["agg_gaussianity"] = self._agg_gaussianity(inc)
+        # Unstandardized: the §4.2 diagnostic-3 ladder as published.
+        results["agg_gaussianity_unstd"] = self._agg_gaussianity(
+            inc, standardize=False
+        )
         results["boundary_scaling"]= self._boundary_scaling(inc, p_pre)
         results["time_effect"]     = self._time_effect(inc)
 
@@ -284,8 +299,25 @@ class StylizedFacts:
         }
 
     def _agg_gaussianity(
-        self, inc: dict[str, np.ndarray]
+        self, inc: dict[str, np.ndarray], standardize: bool = True
     ) -> dict[str, Any]:
+        """Excess kurtosis of k-step aggregated increments.
+
+        `standardize` controls the normalisation, and the two answers are
+        very different — roughly 18.0 against 54.5 at k=1 on the Fed panel:
+
+        * True  — each contract's k-blocks are divided by their own SD
+          before pooling.  This is the §4.2 diagnostic-1 normalisation, and
+          it is what the §4.8 sampling table and the §4.7 validation overlay
+          report (17.98 at daily calendar).
+        * False — blocks are demeaned but not rescaled, so pooling across
+          contracts of differing volatility leaves the scale mixture in.
+          This is the §4.2 diagnostic-3 ladder as published
+          (54.6 → 32.3 → 18.2 → 8.5 → 0.9 → −0.1) and the normalisation the
+          SMM target moment uses.
+
+        Both are legitimate; they must not be mixed inside one table.
+        """
         ks = [1, 2, 4, 8, 16, 32, 64]
         kurtosis_by_k: dict[int, float] = {}
         n_by_k: dict[int, int] = {}
@@ -297,9 +329,12 @@ class StylizedFacts:
                 if n_blocks < 2:
                     continue
                 blocks = dx[: n_blocks * k].reshape(n_blocks, k).sum(axis=1)
-                sd = blocks.std(ddof=1)
-                if sd > 0:
-                    pooled.append((blocks - blocks.mean()) / sd)
+                if standardize:
+                    sd = blocks.std(ddof=1)
+                    if sd > 0:
+                        pooled.append((blocks - blocks.mean()) / sd)
+                else:
+                    pooled.append(blocks - blocks.mean())
             if pooled:
                 flat = np.concatenate(pooled)
                 kurtosis_by_k[k] = float(stats.kurtosis(flat, fisher=True))
@@ -323,9 +358,15 @@ class StylizedFacts:
             p = p_pre.get(cid)
             if p is None:
                 continue
+            # p is predetermined and therefore one shorter than dx: p[i-1]
+            # is the start of increment dx[i].  Align from the END so the
+            # first increment (the one with no predecessor) is the one
+            # dropped, not the last.
             n = min(len(dx), len(p))
-            dx2_list.append(dx[:n] ** 2)
-            pp_list.append(p[:n] * (1.0 - p[:n]))
+            dx_use = dx[len(dx) - n:]
+            p_use = p[len(p) - n:]
+            dx2_list.append(dx_use ** 2)
+            pp_list.append(p_use * (1.0 - p_use))
             cid_list.append(np.full(n, idx, dtype=int))
 
         if not dx2_list:
@@ -418,7 +459,7 @@ class StylizedFacts:
     def _print_summary(self, results: dict) -> None:
         ft = results["fat_tails"]
         vc = results["vol_clustering"]
-        ag = results["agg_gaussianity"]
+        ag = results.get("agg_gaussianity_unstd") or results["agg_gaussianity"]
         bs = results["boundary_scaling"]
         te = results["time_effect"]
 
@@ -457,6 +498,7 @@ class StylizedFacts:
         p_pre: dict[str, np.ndarray],
         tag: str = "real",
     ) -> None:
+        apply_publication_style()
         fig = plt.figure(figsize=(15, 9))
         gs = gridspec.GridSpec(2, 3, figure=fig, hspace=0.42, wspace=0.38)
 
@@ -476,7 +518,8 @@ class StylizedFacts:
 
         # --- 3. Aggregational Gaussianity ---
         ax3 = fig.add_subplot(gs[0, 2])
-        ag = results["agg_gaussianity"]["kurtosis_by_k"]
+        ag = (results.get("agg_gaussianity_unstd")
+              or results["agg_gaussianity"])["kurtosis_by_k"]
         ks = sorted(ag.keys())
         kurts = [ag[k] for k in ks]
         ax3.plot(ks, kurts, "o-", color="steelblue", markersize=5)
@@ -490,9 +533,18 @@ class StylizedFacts:
         # --- 4. Boundary scaling ---
         ax4 = fig.add_subplot(gs[1, 0])
         if p_pre:
-            dx2_vals = np.concatenate([inc[c]**2 for c in inc])
-            pp_vals  = np.concatenate([p_pre[c] * (1 - p_pre[c])
-                                       for c in inc if c in p_pre])
+            # Same predetermined-p alignment as _boundary_scaling: p is one
+            # shorter than dx, so trim dx from the front per contract.
+            dx2_parts, pp_parts = [], []
+            for c in inc:
+                pc = p_pre.get(c)
+                if pc is None:
+                    continue
+                n = min(len(inc[c]), len(pc))
+                dx2_parts.append(inc[c][len(inc[c]) - n:] ** 2)
+                pp_parts.append(pc[len(pc) - n:] * (1 - pc[len(pc) - n:]))
+            dx2_vals = np.concatenate(dx2_parts)
+            pp_vals  = np.concatenate(pp_parts)
             n_plt = min(5000, len(dx2_vals))
             rng = np.random.default_rng(0)
             idx = rng.choice(len(dx2_vals), n_plt, replace=False)
@@ -534,6 +586,5 @@ class StylizedFacts:
         fig.add_subplot(gs[1, 2]).set_visible(False)
 
         out = self.figures_dir / f"stylized_facts_{tag}.png"
-        plt.savefig(out, dpi=130, bbox_inches="tight")
-        plt.close()
-        print(f"  Figure: {out}")
+        written = save_figure(out)
+        print("  Figure: " + ", ".join(str(w) for w in written))

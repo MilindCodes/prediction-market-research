@@ -56,6 +56,7 @@ import config
 from src.smm.bates_smm import (
     BatesSMM, SMMResult, _j_test, compute_moments, MOMENT_LABELS, N_MOMENTS
 )
+from src.figstyle import apply_publication_style, save_figure
 from src.smm.stylized_facts import StylizedFacts, _decompose_panel
 
 
@@ -589,6 +590,7 @@ class NestedLadder:
         kag_real = _kurtosis_by_k(inc_real)
         kag_sim  = sim_facts["agg_gaussianity"]["kurtosis_by_k"]
 
+        apply_publication_style()
         fig, axes = plt.subplots(1, 2, figsize=(11, 4))
 
         # Aggregational Gaussianity overlay — the informative panel.  The
@@ -640,9 +642,8 @@ class NestedLadder:
 
         plt.tight_layout()
         out = self.figures_dir / f"validation_{result.model}.png"
-        plt.savefig(out, dpi=130, bbox_inches="tight")
-        plt.close()
-        print(f"  Validation figure: {out}")
+        written = save_figure(out)
+        print("  Validation figure: " + ", ".join(str(w) for w in written))
 
     def _print_robustness_table(self, results: list[LadderResult]) -> None:
         print("\n=== §4.8 Robustness across κ grid ===")
@@ -820,6 +821,7 @@ def moment_selection_analysis(
         miss_data = df[miss_cols].values
         model_labels = [m.model for m in models]
 
+        apply_publication_style()
         fig, ax = plt.subplots(figsize=(9, 4))
         im = ax.imshow(np.abs(miss_data.T), aspect="auto",
                        cmap=plt.cm.RdYlGn_r, vmin=0.0, vmax=1.0)
@@ -841,9 +843,8 @@ def moment_selection_analysis(
 
         plt.tight_layout()
         out = Path(figures_dir) / "moment_selection.png"
-        plt.savefig(out, dpi=130, bbox_inches="tight")
-        plt.close()
-        print(f"\n  Figure: {out}")
+        written = save_figure(out)
+        print("\n  Figure: " + ", ".join(str(w) for w in written))
     except Exception as e:
         print(f"  (Figure skipped: {e})")
 
@@ -872,12 +873,25 @@ def truncation_sensitivity(
     Baseline is [0.02, 0.98].  The spec specifically requests a [0.01, 0.99]
     sensitivity to check whether jump evidence is a truncation artifact.
 
-    Re-runs the full panel transformation (clip → logit → diff) for each
-    clip pair, then re-runs the SMM calibration on each resulting panel.
+    Each clip pair gets a panel REBUILT FROM RAW, not re-derived from
+    panel_base.  panel_base's rows are already first differences with the
+    leading observation of each contract dropped, so re-differencing it lost
+    one more increment per contract (4141 → 4102) and made the [0.02, 0.98]
+    row a different sample from the §4.4 headline that carries the same
+    label.  Rebuilding keeps every increment and keeps the baseline row
+    comparable.  Each clip caches to its own parquet, so the §4.4 panel is
+    never overwritten.
+
+    The fit also goes through the same NestedLadder.run_selection path as
+    §4.4 (warm starts + cross-model polish).  Calling fit_bates directly
+    used grid starts only and settled in a worse corner of the same basin,
+    which was the second reason the two tables disagreed.
+
     Returns a summary DataFrame comparing σ_v, σ_J, J, p across clip pairs.
     """
-    import config as _cfg
+    import src.smm.panel as _panel_mod
     from src.smm.panel import CLIP_LO as _DEFAULT_LO, CLIP_HI as _DEFAULT_HI
+    from src.smm.panel import SMMPanelBuilder as _Builder
 
     clip_pairs = clip_pairs or [
         (_DEFAULT_LO, _DEFAULT_HI),  # baseline [0.02, 0.98]
@@ -885,44 +899,44 @@ def truncation_sensitivity(
     ]
     figures_dir = figures_dir or (config.DATA_DIR / "processed" / "figures")
 
+    tickers = list(pd.unique(panel_base["contract_id"]))
+    saved_lo, saved_hi = _panel_mod.CLIP_LO, _panel_mod.CLIP_HI
+    processed = config.DATA_DIR / "processed"
+
     rows = []
-    for clip_lo, clip_hi in clip_pairs:
-        label = f"[{clip_lo},{clip_hi}]"
-        print(f"\n--- Truncation sensitivity {label} ---")
+    try:
+        for clip_lo, clip_hi in clip_pairs:
+            label = f"[{clip_lo},{clip_hi}]"
+            print(f"\n--- Truncation sensitivity {label} ---")
 
-        # Re-apply clip/logit/diff to the base panel's raw p column.
-        # p_raw is the unclipped price — clipping the already-clipped p
-        # column would make every clip pair a no-op.
-        panel = panel_base.copy()
-        src_col = "p_raw" if "p_raw" in panel.columns else "p"
-        p_re = np.clip(panel[src_col].values, clip_lo, clip_hi)
-        X_re = np.log(p_re / (1.0 - p_re))
+            # Rebuild from raw at this clip.  A dedicated cache path per clip
+            # keeps the §4.4 baseline panel (smm_panel.parquet) untouched.
+            _panel_mod.CLIP_LO, _panel_mod.CLIP_HI = clip_lo, clip_hi
+            out_panel = processed / f"smm_panel_clip_{clip_lo}_{clip_hi}.parquet"
 
-        # Recompute delta_X within each contract
-        panel["p"] = p_re
-        panel["X"] = X_re
-        new_dx = []
-        for cid, grp in panel.groupby("contract_id", sort=False):
-            grp = grp.sort_values("t")
-            X = grp["X"].values
-            dx = np.empty(len(X))
-            dx[0] = np.nan
-            dx[1:] = X[1:] - X[:-1]
-            new_dx.append(pd.Series(dx, index=grp.index))
-        panel["delta_X"] = pd.concat(new_dx)
-        panel = panel.dropna(subset=["delta_X"]).reset_index(drop=True)
+            class _ClipBuilder(_Builder):
+                def panel_path(self):
+                    return out_panel
 
-        cache = calibrator.prepare(panel)
-        res   = calibrator.fit_bates(cache, kappa=kappa, free_kappa=True,
-                                     verbose=True)
+            panel = _ClipBuilder(client=None).build(tickers=tickers, force=True)
 
-        rows.append({
-            "clip": label, "clip_lo": clip_lo, "clip_hi": clip_hi,
-            "sigma_v": res.sigma_v, "sigma_J": res.sigma_J, "kappa": res.kappa,
-            "theta": res.theta, "lambda": res.lambda_,
-            "j_stat": res.j_stat, "j_pvalue": res.j_pvalue,
-            "n_real": res.n_real,
-        })
+            # Same ladder path as §4.4 so the baseline row is comparable.
+            ladder = NestedLadder(calibrator=calibrator, kappa_init=kappa)
+            res = ladder.run_selection(panel, verbose=False,
+                                       save_as=None, moment_table_as=None).bates
+            print(f"    σ_v={res.sigma_v:.4f}  σ_J={res.sigma_J:.4f}  "
+                  f"κ̂={res.kappa:.6f}  J={res.j_stat:.3f}  n={res.n_real}")
+
+            rows.append({
+                "clip": label, "clip_lo": clip_lo, "clip_hi": clip_hi,
+                "sigma_v": res.sigma_v, "sigma_J": res.sigma_J,
+                "kappa": res.kappa,
+                "theta": res.theta, "lambda": res.lambda_,
+                "j_stat": res.j_stat, "j_pvalue": res.j_pvalue,
+                "n_real": res.n_real,
+            })
+    finally:
+        _panel_mod.CLIP_LO, _panel_mod.CLIP_HI = saved_lo, saved_hi
 
     df = pd.DataFrame(rows)
     print("\n=== §4.8 Truncation sensitivity ===")
@@ -1203,11 +1217,13 @@ def bucketing_analysis(
     try:
         lengths["bucket"] = pd.qcut(
             lengths["n_increments"], q=n_buckets,
-            labels=[f"Q{i+1}" for i in range(n_buckets)],
+            # n_buckets is 3, so these are terciles: label them T, not Q.
+            # "Q1-Q3" reads as quartiles and was mislabelled in §4.8.
+            labels=[f"T{i+1}" for i in range(n_buckets)],
             duplicates="drop",
         )
     except ValueError:
-        lengths["bucket"] = "Q1"
+        lengths["bucket"] = "T1"
 
     rows = []
     for bucket_label, bucket_tickers in lengths.groupby("bucket", observed=True)["contract_id"]:
