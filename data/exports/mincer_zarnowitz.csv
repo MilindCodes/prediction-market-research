@@ -1,0 +1,2 @@
+n_contracts,n_dropped,n_obs,alpha,se_alpha,t_alpha_vs0,p_alpha,beta,se_beta,t_beta_vs1,p_beta,wald_joint,p_joint_chi2,p_joint_F
+34,5,3894,-0.012625,0.005806,-2.174514,0.036938,0.973560,0.014442,-1.830722,0.076185,16.960238,0.000208,0.001067
