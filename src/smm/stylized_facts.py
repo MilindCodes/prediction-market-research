@@ -109,13 +109,21 @@ class StylizedFacts:
     ----------
     figures_dir : Path | None
         Where to save output figures. Default: data/processed/figures/.
+    tables_dir : Path | None
+        Where to save the per-run results table. Default: data/processed/.
     """
 
-    def __init__(self, figures_dir: Path | None = None):
+    def __init__(
+        self,
+        figures_dir: Path | None = None,
+        tables_dir: Path | None = None,
+    ):
         self.figures_dir = (
             figures_dir or (config.DATA_DIR / "processed" / "figures")
         )
         self.figures_dir.mkdir(parents=True, exist_ok=True)
+        self.tables_dir = tables_dir or (config.DATA_DIR / "processed")
+        self.tables_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
     # Public API
@@ -172,6 +180,7 @@ class StylizedFacts:
 
         self._print_summary(results)
         self._plot(results, pooled_std, inc, p_pre, tag=tag)
+        self._save_table(results, tag=tag)
         return results
 
     def validate_synthetic(self) -> dict[str, dict]:
@@ -451,6 +460,39 @@ class StylizedFacts:
             "log_var_ratio_p": float(t_p),
             "n_contracts": int(len(log_ratios)),
         }
+
+    # ------------------------------------------------------------------
+    # Saving
+    # ------------------------------------------------------------------
+
+    def _save_table(self, results: dict, tag: str) -> Path:
+        """Write every diagnostic to stylized_facts_<tag>.csv.
+
+        These numbers used to exist only in memory and stdout, so a value
+        quoted in the draft had nothing to be checked against.  Long
+        format, one row per statistic; nested dicts (ACF by lag, kurtosis
+        by k) become `name[key]`.  %.6g rather than the usual %.6f so small
+        p-values are not flattened to zero.
+        """
+        rows: list[dict[str, Any]] = []
+        for diag, val in results.items():
+            if not isinstance(val, dict):
+                rows.append({"diagnostic": "panel", "statistic": diag,
+                             "value": val})
+                continue
+            for stat, v in val.items():
+                if isinstance(v, dict):
+                    for key, vk in v.items():
+                        rows.append({"diagnostic": diag,
+                                     "statistic": f"{stat}[{key}]",
+                                     "value": vk})
+                else:
+                    rows.append({"diagnostic": diag, "statistic": stat,
+                                 "value": v})
+        out = self.tables_dir / f"stylized_facts_{tag}.csv"
+        pd.DataFrame(rows).to_csv(out, index=False, float_format="%.6g")
+        print(f"  Table: {out}")
+        return out
 
     # ------------------------------------------------------------------
     # Printing

@@ -1,0 +1,14 @@
+statistic,empirical,simulated
+boundary_slope,0.220833,-0.290981
+boundary_intercept,0.065246,0.124328
+boundary_se_slope_cluster,0.160373,0.024435
+boundary_t_stat,1.376998,-11.908529
+boundary_n_obs,4102.000000,82750.000000
+boundary_n_contracts,39.000000,50.000000
+kurtosis_k1,17.980594,78.603079
+kurtosis_k2,10.002484,39.932811
+kurtosis_k4,4.044408,21.421354
+kurtosis_k8,1.498882,11.436967
+kurtosis_k16,0.439052,6.351507
+kurtosis_k32,-0.667974,2.931539
+kurtosis_k64,-1.387357,1.125856

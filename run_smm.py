@@ -172,7 +172,12 @@ def step_validate_model(model: str = "Bates") -> None:
     panel = pd.read_parquet("data/processed/smm_panel.parquet")
     cal = BatesSMM(n_sim_multiplier=20, n_bootstrap=N_BOOTSTRAP, n_restarts=2)
     ladder = NestedLadder(calibrator=cal)
-    lr = ladder.run_selection(panel, verbose=True)
+    # Refit only to get the selected model.  The §4.4 headline CSVs belong
+    # to `select` / `ladder` (n_restarts=3); a 2-restart refit must not
+    # overwrite them.
+    lr = ladder.run_selection(
+        panel, verbose=True, save_as=None, moment_table_as=None
+    )
 
     selected = {
         "Bates":       lr.bates,

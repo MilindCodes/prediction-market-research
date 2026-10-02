@@ -57,7 +57,9 @@ from src.smm.bates_smm import (
     BatesSMM, SMMResult, _j_test, compute_moments, MOMENT_LABELS, N_MOMENTS
 )
 from src.figstyle import apply_publication_style, save_figure
-from src.smm.stylized_facts import StylizedFacts, _decompose_panel
+from src.smm.stylized_facts import (
+    StylizedFacts, _decompose_panel, _predetermined_p,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +330,9 @@ class NestedLadder:
         res_sim = sf.run(syn_panel, tag=f"sim_{selected_result.model}")
 
         # Overlay: empirical vs simulated kurtosis-by-k
-        self._plot_validation_overlay(panel, res_sim, selected_result)
+        res_real = self._empirical_facts(panel)
+        self._plot_validation_overlay(res_real, res_sim, selected_result)
+        self._save_validation_table(res_real, res_sim, selected_result.model)
 
     # ------------------------------------------------------------------
     # Internal
@@ -556,38 +560,63 @@ class NestedLadder:
             }))
         return pd.concat(rows, ignore_index=True)
 
+    @staticmethod
+    def _empirical_facts(panel: pd.DataFrame) -> dict:
+        """Empirical side of the §4.7 overlay.
+
+        Calls the same StylizedFacts methods that produce the §4.2 numbers
+        rather than re-deriving them here.  A hand-rolled copy of the
+        kurtosis ladder used to live in the overlay, and the draft's §4.7
+        boundary slope (0.237) had drifted from §4.2's (0.221).  Sharing one
+        code path means the two sections cannot disagree.
+        """
+        sf = StylizedFacts()
+        inc = _decompose_panel(panel)
+        return {
+            "agg_gaussianity": sf._agg_gaussianity(inc),
+            "boundary_scaling": sf._boundary_scaling(
+                inc, _predetermined_p(panel)
+            ),
+        }
+
+    @staticmethod
+    def _save_validation_table(
+        real_facts: dict,
+        sim_facts: dict,
+        model: str,
+    ) -> pd.DataFrame:
+        """§4.7 — empirical beside simulated, one row per statistic.
+
+        Saved so the slope and kurtosis values quoted in §4.7 can be checked
+        against a file, the same way §4.2's are (stylized_facts_real.csv).
+        """
+        bs_r, bs_s = real_facts["boundary_scaling"], sim_facts["boundary_scaling"]
+        rows = [
+            {"statistic": f"boundary_{s}", "empirical": bs_r[s],
+             "simulated": bs_s[s]}
+            for s in ("slope", "intercept", "se_slope_cluster", "t_stat",
+                      "n_obs", "n_contracts")
+        ]
+        kag_r = real_facts["agg_gaussianity"]["kurtosis_by_k"]
+        kag_s = sim_facts["agg_gaussianity"]["kurtosis_by_k"]
+        for k in sorted(set(kag_r) | set(kag_s)):
+            rows.append({"statistic": f"kurtosis_k{k}",
+                         "empirical": kag_r.get(k, np.nan),
+                         "simulated": kag_s.get(k, np.nan)})
+        df = pd.DataFrame(rows)
+        out = config.DATA_DIR / "processed" / f"validation_{model}.csv"
+        df.to_csv(out, index=False, float_format="%.6f")
+        print(f"  Validation table: {out}")
+        return df
+
     def _plot_validation_overlay(
         self,
-        panel: pd.DataFrame,
+        real_facts: dict,
         sim_facts: dict,
         result: SMMResult,
     ) -> None:
         """Overlay empirical and simulated aggregational-Gaussianity curves."""
-        from src.smm.stylized_facts import StylizedFacts, _decompose_panel
-
-        inc_real = _decompose_panel(panel)
-
-        ks = [1, 2, 4, 8, 16, 32, 64]
-
-        def _kurtosis_by_k(inc: dict) -> dict:
-            from scipy import stats as _stats
-            out: dict[int, float] = {}
-            for k in ks:
-                pooled = []
-                for dx in inc.values():
-                    nb = len(dx) // k
-                    if nb < 2:
-                        continue
-                    blocks = dx[:nb * k].reshape(nb, k).sum(axis=1)
-                    sd = blocks.std(ddof=1)
-                    if sd > 0:
-                        pooled.append((blocks - blocks.mean()) / sd)
-                if pooled:
-                    flat = np.concatenate(pooled)
-                    out[k] = float(_stats.kurtosis(flat, fisher=True))
-            return out
-
-        kag_real = _kurtosis_by_k(inc_real)
+        kag_real = real_facts["agg_gaussianity"]["kurtosis_by_k"]
         kag_sim  = sim_facts["agg_gaussianity"]["kurtosis_by_k"]
 
         apply_publication_style()
@@ -613,9 +642,7 @@ class NestedLadder:
         # Boundary scaling: empirical vs simulated slope.  The empirical
         # slope has to be COMPUTED from the real panel — it was previously
         # hard-coded to 0.0, which drew a comparison that was not one.
-        from src.smm.stylized_facts import StylizedFacts as _SF, _predetermined_p
-        p_pre = _predetermined_p(panel)
-        bs_real = _SF()._boundary_scaling(inc_real, p_pre)
+        bs_real = real_facts["boundary_scaling"]
         bs_sim  = sim_facts["boundary_scaling"]
         ax2 = axes[1]
         ax2.bar(
